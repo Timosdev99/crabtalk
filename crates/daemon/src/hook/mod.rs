@@ -1,34 +1,27 @@
 //! Stateful Hook implementation for the daemon.
 //!
-//! [`DaemonHook`] composes memory, skill, MCP, and OS sub-hooks.
-//! `on_build_agent` delegates to skills and memory; `on_register_tools`
-//! delegates to all sub-hooks in sequence. `dispatch_tool` routes every
-//! agent tool call by name — the single entry point from `event.rs`.
+//! [`DaemonHook`] composes skill, MCP, and OS sub-hooks plus external WHS
+//! services. Memory is handled by an external WHS service.
+//! `on_build_agent` delegates to skills and WHS services;
+//! `on_register_tools` delegates to all sub-hooks in sequence.
+//! `dispatch_tool` routes every agent tool call by name — the single
+//! entry point from `event.rs`.
 
 use crate::{
     ext::hub::DownloadRegistry,
-    hook::{
-        mcp::McpHandler, memory::MemoryHook, os::PermissionConfig, skill::SkillHandler,
-        task::TaskRegistry,
-    },
+    hook::{mcp::McpHandler, os::PermissionConfig, skill::SkillHandler, task::TaskRegistry},
+    service::ServiceRegistry,
 };
 use compact_str::CompactString;
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::Mutex;
-use wcore::{AgentConfig, AgentEvent, Hook, ToolRegistry, model::Message};
+use wcore::{AgentConfig, AgentEvent, Hook, ToolRegistry};
 
 pub mod mcp;
-pub mod memory;
 pub mod os;
-pub mod search;
 pub mod skill;
 pub mod task;
 
-/// Stateful Hook implementation for the daemon.
-///
-/// Composes memory, skill, MCP, and OS sub-hooks. Each sub-hook
-/// self-registers its tools via `on_register_tools`. All tool dispatch
-/// is routed through `dispatch_tool`.
 /// Per-agent scope for dispatch enforcement. Empty vecs = unrestricted.
 #[derive(Default)]
 pub(crate) struct AgentScope {
@@ -39,7 +32,6 @@ pub(crate) struct AgentScope {
 }
 
 pub struct DaemonHook {
-    pub memory: MemoryHook,
     pub skills: SkillHandler,
     pub mcp: McpHandler,
     pub tasks: Arc<Mutex<TaskRegistry>>,
@@ -49,29 +41,16 @@ pub struct DaemonHook {
     pub sandboxed: bool,
     /// Per-agent scope maps, populated during load_agents.
     pub(crate) scopes: BTreeMap<CompactString, AgentScope>,
-    pub(crate) aggregator: wsearch::aggregator::Aggregator,
-    pub(crate) fetch_client: reqwest::Client,
+    /// External hook service registry (tools + queries).
+    pub(crate) registry: Option<ServiceRegistry>,
 }
 
 /// OS tool names — bypass permission check when running in sandbox mode.
 const OS_TOOLS: &[&str] = &["read", "write", "edit", "bash"];
 
-/// Base tools always included in every agent's whitelist (memory + OS).
-const BASE_TOOLS: &[&str] = &[
-    "remember",
-    "recall",
-    "relate",
-    "connections",
-    "compact",
-    "distill",
-    "__journal__",
-    "read",
-    "write",
-    "edit",
-    "bash",
-    "web_search",
-    "web_fetch",
-];
+/// Base tools always included in every agent's whitelist (OS tools).
+/// Memory tools come from the external WHS service.
+const BASE_TOOLS: &[&str] = &["read", "write", "edit", "bash"];
 
 /// Skill discovery/loading tools.
 const SKILL_TOOLS: &[&str] = &["search_skill", "load_skill"];
@@ -90,20 +69,16 @@ const TASK_TOOLS: &[&str] = &[
 
 impl DaemonHook {
     /// Create a new DaemonHook with the given backends.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        memory: MemoryHook,
         skills: SkillHandler,
         mcp: McpHandler,
         tasks: Arc<Mutex<TaskRegistry>>,
         downloads: Arc<Mutex<DownloadRegistry>>,
         permissions: PermissionConfig,
         sandboxed: bool,
-        aggregator: wsearch::aggregator::Aggregator,
-        fetch_client: reqwest::Client,
+        registry: Option<ServiceRegistry>,
     ) -> Self {
         Self {
-            memory,
             skills,
             mcp,
             tasks,
@@ -111,8 +86,7 @@ impl DaemonHook {
             permissions,
             sandboxed,
             scopes: BTreeMap::new(),
-            aggregator,
-            fetch_client,
+            registry,
         }
     }
 
@@ -173,6 +147,21 @@ impl DaemonHook {
         }
     }
 
+    /// Dispatch to an external hook service if the tool is registered.
+    /// Returns `None` if the tool is not in the registry (fall through to in-process).
+    async fn dispatch_external(
+        &self,
+        name: &str,
+        args: &str,
+        agent: &str,
+        task_id: Option<u64>,
+    ) -> Option<String> {
+        self.registry
+            .as_ref()?
+            .dispatch_tool(name, args, agent, task_id)
+            .await
+    }
+
     /// Route a tool call by name to the appropriate handler.
     ///
     /// This is the single dispatch entry point — `event.rs` calls this
@@ -197,13 +186,6 @@ impl DaemonHook {
             return format!("tool not available: {name}");
         }
         match name {
-            "remember" => self.memory.dispatch_remember(args).await,
-            "recall" => self.memory.dispatch_recall(args).await,
-            "relate" => self.memory.dispatch_relate(args).await,
-            "connections" => self.memory.dispatch_connections(args).await,
-            "compact" => self.memory.dispatch_compact(agent).await,
-            "__journal__" => self.memory.dispatch_journal(args, agent).await,
-            "distill" => self.memory.dispatch_distill(args, agent).await,
             "search_mcp" => self.dispatch_search_mcp(args, agent).await,
             "call_mcp_tool" => self.dispatch_call_mcp_tool(args, agent).await,
             "search_skill" => self.dispatch_search_skill(args, agent).await,
@@ -217,9 +199,11 @@ impl DaemonHook {
             "create_task" => self.dispatch_create_task(args, agent).await,
             "ask_user" => self.dispatch_ask_user(args, task_id).await,
             "await_tasks" => self.dispatch_await_tasks(args, task_id).await,
-            "web_search" => self.dispatch_web_search(args).await,
-            "web_fetch" => self.dispatch_web_fetch(args).await,
+            // External hook services, then MCP bridge as final fallback.
             name => {
+                if let Some(result) = self.dispatch_external(name, args, agent, task_id).await {
+                    return result;
+                }
                 tracing::debug!(tool = name, "forwarding tool to MCP bridge");
                 let bridge = self.mcp.bridge().await;
                 bridge.call(name, args).await
@@ -230,7 +214,11 @@ impl DaemonHook {
 
 impl Hook for DaemonHook {
     fn on_build_agent(&self, config: AgentConfig) -> AgentConfig {
-        let mut config = self.memory.on_build_agent(config);
+        // Delegate to WHS services first (prompt enrichment).
+        let mut config = match self.registry {
+            Some(ref registry) => registry.on_build_agent(config),
+            None => config,
+        };
 
         // Walrus agent (empty scoping) gets all tools, no scope injection.
         let has_scoping =
@@ -239,9 +227,14 @@ impl Hook for DaemonHook {
             return config;
         }
 
-        // Compute tool whitelist — base tools always included.
+        // Compute tool whitelist — base tools + external service tools always included.
         let mut whitelist: Vec<CompactString> =
             BASE_TOOLS.iter().map(|&s| CompactString::from(s)).collect();
+        if let Some(ref registry) = self.registry {
+            for tool_name in registry.tools.keys() {
+                whitelist.push(CompactString::from(tool_name.as_str()));
+            }
+        }
         let mut scope_lines = Vec::new();
 
         // Skill tools if skills non-empty.
@@ -302,20 +295,30 @@ impl Hook for DaemonHook {
     }
 
     fn on_compact(&self, prompt: &mut String) {
-        self.memory.on_compact(prompt);
+        if let Some(ref registry) = self.registry {
+            registry.on_compact(prompt);
+        }
     }
 
-    fn on_before_run(&self, agent: &str, history: &[Message]) -> Vec<Message> {
-        self.memory.on_before_run(agent, history)
+    fn on_before_run(
+        &self,
+        agent: &str,
+        history: &[wcore::model::Message],
+    ) -> Vec<wcore::model::Message> {
+        match self.registry {
+            Some(ref registry) => registry.on_before_run(agent, history),
+            None => Vec::new(),
+        }
     }
 
     async fn on_register_tools(&self, tools: &mut ToolRegistry) {
-        self.memory.on_register_tools(tools).await;
         self.mcp.on_register_tools(tools).await;
         tools.insert_all(os::tool::tools());
-        tools.insert_all(search::tool::tools());
         tools.insert_all(skill::tool::tools());
         tools.insert_all(task::tool::tools());
+        if let Some(ref registry) = self.registry {
+            registry.on_register_tools(tools).await;
+        }
     }
 
     fn on_event(&self, agent: &str, event: &AgentEvent) {

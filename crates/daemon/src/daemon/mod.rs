@@ -8,6 +8,7 @@ use crate::{
     DaemonConfig,
     daemon::event::{DaemonEvent, DaemonEventSender},
     hook::DaemonHook,
+    service::ServiceManager,
 };
 use ::socket::server::accept_loop;
 use anyhow::Result;
@@ -20,7 +21,6 @@ use std::{
 use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 use wcore::AgentConfig;
 use wcore::Runtime;
-use wcore::protocol::message::client::ClientMessage;
 
 pub(crate) mod builder;
 pub mod event;
@@ -58,7 +58,8 @@ impl Daemon {
         tracing::info!("loaded configuration from {}", config_path.display());
 
         let (event_tx, event_rx) = mpsc::unbounded_channel::<DaemonEvent>();
-        let daemon = Daemon::build(&config, config_dir, event_tx.clone()).await?;
+        let (daemon, service_manager) =
+            Daemon::build(&config, config_dir, event_tx.clone()).await?;
 
         // Broadcast shutdown — all subsystems subscribe.
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
@@ -113,14 +114,15 @@ impl Daemon {
             shutdown_tx,
             daemon,
             event_loop_join: Some(event_loop_join),
+            service_manager,
         })
     }
 }
 
 /// Handle returned by [`Daemon::start`] — holds the event sender and shutdown trigger.
 ///
-/// The caller spawns transports (socket, channels) using [`setup_socket`] and
-/// [`setup_channels`], passing clones of `event_tx` and `shutdown_tx`.
+/// The caller spawns transports (socket, TCP) using [`setup_socket`] and
+/// [`setup_tcp`], passing clones of `event_tx` and `shutdown_tx`.
 pub struct DaemonHandle {
     /// The loaded daemon configuration.
     pub config: DaemonConfig,
@@ -133,6 +135,8 @@ pub struct DaemonHandle {
     #[allow(unused)]
     daemon: Daemon,
     event_loop_join: Option<tokio::task::JoinHandle<()>>,
+    /// Managed child services — shutdown on daemon stop.
+    service_manager: Option<ServiceManager>,
 }
 
 impl DaemonHandle {
@@ -147,6 +151,10 @@ impl DaemonHandle {
     ///
     /// Transport tasks (socket, channels) are the caller's responsibility.
     pub async fn shutdown(mut self) -> Result<()> {
+        // Shutdown managed services before the event loop.
+        if let Some(ref mut sm) = self.service_manager {
+            sm.shutdown_all().await;
+        }
         let _ = self.shutdown_tx.send(());
         if let Some(join) = self.event_loop_join.take() {
             join.await?;
@@ -184,31 +192,6 @@ pub fn setup_socket(
     ));
 
     Ok((resolved_path, join))
-}
-
-/// Spawn channel transports.
-pub async fn setup_channels(config: &DaemonConfig, event_tx: &DaemonEventSender) {
-    let tx = event_tx.clone();
-    let on_message = Arc::new(move |msg: ClientMessage| {
-        let tx = tx.clone();
-        async move {
-            let (reply_tx, reply_rx) = mpsc::unbounded_channel();
-            let _ = tx.send(DaemonEvent::Message {
-                msg,
-                reply: reply_tx,
-            });
-            reply_rx
-        }
-    });
-
-    // Use the first configured agent name as the default, falling back to "assistant".
-    let agents_dir = wcore::paths::CONFIG_DIR.join(wcore::paths::AGENTS_DIR);
-    let default_agent = crate::config::load_agents_dir(&agents_dir)
-        .ok()
-        .and_then(|agents| agents.into_iter().next())
-        .map(|(stem, _)| compact_str::CompactString::from(stem))
-        .unwrap_or_else(|| compact_str::CompactString::from("assistant"));
-    channel::spawn_channels(&config.channel, default_agent, on_message).await;
 }
 
 /// Bind a TCP listener and spawn the accept loop.

@@ -2,13 +2,11 @@
 
 pub use crate::hook::{
     mcp::McpServerConfig,
-    memory::MemoryConfig,
     os::{PermissionConfig, ToolPermission},
     task::TasksConfig,
 };
 pub use ::model::{ModelConfig, ProviderConfig, ProviderManager};
 use anyhow::Result;
-pub use channel::ChannelConfig;
 pub use loader::{load_agents_dir, scaffold_config_dir};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -28,15 +26,9 @@ pub struct DaemonConfig {
     /// Model configurations (remote API endpoints + local models).
     #[serde(default)]
     pub model: ModelConfig,
-    /// Channel configurations (Telegram, Discord bots).
-    #[serde(default)]
-    pub channel: ChannelConfig,
     /// MCP server configurations.
     #[serde(default)]
     pub mcps: BTreeMap<String, McpServerConfig>,
-    /// Memory configuration.
-    #[serde(default)]
-    pub memory: MemoryConfig,
     /// Task executor pool configuration.
     #[serde(default)]
     pub tasks: TasksConfig,
@@ -46,9 +38,9 @@ pub struct DaemonConfig {
     /// Permission configuration: global defaults + per-agent overrides.
     #[serde(default)]
     pub permissions: PermissionConfig,
-    /// Search engine configuration.
+    /// Managed child services (`[services.<name>]`).
     #[serde(default)]
-    pub search: wsearch::config::Config,
+    pub services: BTreeMap<String, crate::service::ServiceConfig>,
 }
 
 impl DaemonConfig {

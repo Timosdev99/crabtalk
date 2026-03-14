@@ -19,7 +19,6 @@ default = ["daemon"]
 daemon = ["dep:daemon"]
 
 [dependencies]
-channel.workspace = true
 daemon = { workspace = true, optional = true }
 socket.workspace = true
 tcp.workspace = true
@@ -32,13 +31,11 @@ clap.workspace = true
 crossterm.workspace = true
 openssl-sys.workspace = true
 compact_str.workspace = true
-dirs.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
 ratatui.workspace = true
 rustyline.workspace = true
 tokio.workspace = true
-toml.workspace = true
 toml_edit.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

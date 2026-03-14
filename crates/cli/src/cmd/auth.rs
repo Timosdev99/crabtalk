@@ -1,7 +1,6 @@
-//! Interactive TUI for configuring channel tokens.
+//! Interactive TUI for configuring gateway tokens.
 
 use anyhow::{Context, Result};
-use channel::ChannelType;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
@@ -17,6 +16,33 @@ use ratatui::{
 };
 use std::{io::Stdout, time::Duration};
 use toml_edit::{DocumentMut, Item, Table};
+
+/// Supported gateway platforms.
+#[derive(Clone, Copy)]
+enum GatewayType {
+    Telegram,
+    Discord,
+}
+
+impl GatewayType {
+    const VARIANTS: &[Self] = &[Self::Telegram, Self::Discord];
+
+    fn token_hint(self) -> &'static str {
+        match self {
+            Self::Telegram => "https://core.telegram.org/bots#botfather",
+            Self::Discord => "https://discord.com/developers/applications",
+        }
+    }
+}
+
+impl std::fmt::Display for GatewayType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Telegram => f.write_str("Telegram"),
+            Self::Discord => f.write_str("Discord"),
+        }
+    }
+}
 
 /// Configure channel tokens interactively.
 #[derive(clap::Args, Debug)]
@@ -333,7 +359,7 @@ fn render_list(frame: &mut Frame, state: &AuthState, area: Rect) {
 fn render_fields(frame: &mut Frame, state: &AuthState, area: Rect) {
     let name = PLATFORM_NAMES[state.selected];
     let token = state.current_token();
-    let channel_type = ChannelType::VARIANTS[state.selected];
+    let channel_type = GatewayType::VARIANTS[state.selected];
 
     let block = Block::default()
         .title(format!(" {name} "))
