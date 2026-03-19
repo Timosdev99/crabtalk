@@ -1,8 +1,6 @@
 [package]
-name = "crabtalk-daemon"
-description = "Crabtalk agent runtime with memory, tools, and local inference"
-documentation = "https://docs.rs/crabtalk-daemon"
-readme = "README.md"
+name = "crabhub"
+description = "Hub package management for Crabtalk"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -11,23 +9,14 @@ repository.workspace = true
 keywords.workspace = true
 
 [dependencies]
-crabhub.workspace = true
-model.workspace = true
-transport.workspace = true
 wcore.workspace = true
-
 # crates.io
 anyhow.workspace = true
 async-stream.workspace = true
-chrono.workspace = true
 futures-core.workspace = true
-futures-util.workspace = true
-rmcp.workspace = true
-schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yml.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["process"] }
 toml.workspace = true
 toml_edit.workspace = true
 tracing.workspace = true

@@ -8,7 +8,6 @@
 
 use crate::{
     daemon::event::DaemonEventSender,
-    ext::hub::DownloadRegistry,
     hook::{
         mcp::McpHandler,
         os::PermissionConfig,
@@ -17,6 +16,7 @@ use crate::{
     },
     service::ServiceRegistry,
 };
+use crabhub::DownloadRegistry;
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::Mutex;
 use wcore::{AgentConfig, AgentEvent, Hook, ToolRegistry, model::Message};
@@ -41,15 +41,17 @@ pub struct DaemonHook {
     pub tasks: Arc<Mutex<TaskSet>>,
     pub downloads: Arc<Mutex<DownloadRegistry>>,
     pub permissions: PermissionConfig,
-    /// Whether the daemon is running as the `walrus` OS user (sandbox active).
+    /// Whether the daemon is running as the `crabtalk` OS user (sandbox active).
     pub sandboxed: bool,
+    /// Working directory for agent commands (caller's cwd at daemon startup).
+    pub cwd: std::path::PathBuf,
     /// Built-in memory.
     pub memory: Option<Memory>,
     /// Event channel for task dispatch.
     pub(crate) event_tx: DaemonEventSender,
     /// Per-agent scope maps, populated during load_agents.
     pub(crate) scopes: BTreeMap<String, AgentScope>,
-    /// Sub-agent descriptions for catalog injection into the walrus agent.
+    /// Sub-agent descriptions for catalog injection into the crab agent.
     pub(crate) agent_descriptions: BTreeMap<String, String>,
     /// External extension service registry (tools + queries).
     pub(crate) registry: Option<Arc<ServiceRegistry>>,
@@ -76,7 +78,7 @@ impl Hook for DaemonHook {
         // Inject environment context (OS, working directory, sandbox state).
         config
             .system_prompt
-            .push_str(&os::environment_block(self.sandboxed));
+            .push_str(&os::environment_block(&self.cwd, self.sandboxed));
 
         // Inject built-in memory prompt if active.
         if let Some(ref mem) = self.memory {
@@ -211,6 +213,7 @@ impl DaemonHook {
         downloads: Arc<Mutex<DownloadRegistry>>,
         permissions: PermissionConfig,
         sandboxed: bool,
+        cwd: std::path::PathBuf,
         memory: Option<Memory>,
         registry: Option<Arc<ServiceRegistry>>,
         event_tx: DaemonEventSender,
@@ -222,6 +225,7 @@ impl DaemonHook {
             downloads,
             permissions,
             sandboxed,
+            cwd,
             memory,
             event_tx,
             scopes: BTreeMap::new(),
@@ -248,7 +252,7 @@ impl DaemonHook {
     }
 
     /// Apply scoped tool whitelist and scope prompt for sub-agents.
-    /// No-op for the walrus agent (empty scoping = all tools).
+    /// No-op for the crab agent (empty scoping = all tools).
     fn apply_scope(&self, config: &mut AgentConfig) {
         let has_scoping =
             !config.skills.is_empty() || !config.mcps.is_empty() || !config.members.is_empty();

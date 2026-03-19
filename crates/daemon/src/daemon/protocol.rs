@@ -157,14 +157,14 @@ impl Server for Daemon {
             let registry = rt.hook.downloads.clone();
             match action {
                 HubAction::Install => {
-                    let s = crate::ext::hub::package::install(package, registry, filters);
+                    let s = crabhub::package::install(package, registry, filters);
                     pin_mut!(s);
                     while let Some(event) = s.next().await {
                         yield event?;
                     }
                 }
                 HubAction::Uninstall => {
-                    let s = crate::ext::hub::package::uninstall(package, registry, filters);
+                    let s = crabhub::package::uninstall(package, registry, filters);
                     pin_mut!(s);
                     while let Some(event) = s.next().await {
                         yield event?;
@@ -212,7 +212,7 @@ impl Server for Daemon {
             serde_json::from_str(&config).context("invalid DaemonConfig JSON")?;
         let toml_str =
             toml::to_string_pretty(&parsed).context("failed to serialize config to TOML")?;
-        let config_path = self.config_dir.join("walrus.toml");
+        let config_path = self.config_dir.join("crab.toml");
         std::fs::write(&config_path, toml_str)
             .with_context(|| format!("failed to write {}", config_path.display()))?;
         self.reload().await
@@ -352,7 +352,7 @@ impl Server for Daemon {
         svc.config = parsed;
         let toml_str =
             toml::to_string_pretty(&daemon_config).context("failed to serialize config to TOML")?;
-        let config_path = self.config_dir.join("walrus.toml");
+        let config_path = self.config_dir.join("crab.toml");
         std::fs::write(&config_path, toml_str)
             .with_context(|| format!("failed to write {}", config_path.display()))?;
         self.reload().await
@@ -366,6 +366,6 @@ impl Server for Daemon {
 impl Daemon {
     /// Load the current `DaemonConfig` from disk.
     fn load_config(&self) -> Result<crate::DaemonConfig> {
-        crate::DaemonConfig::load(&self.config_dir.join("walrus.toml"))
+        crate::DaemonConfig::load(&self.config_dir.join("crab.toml"))
     }
 }

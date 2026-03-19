@@ -1,10 +1,10 @@
-//! walrus hub manifest
+//! Crabtalk hub manifest.
 
-use crate::{hook::mcp::McpServerConfig, service::ServiceConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use wcore::{McpServerConfig, ServiceConfig};
 
-/// Walrus resource manifest
+/// Crabtalk resource manifest.
 #[derive(Serialize, Deserialize)]
 pub struct Manifest {
     /// the package manifest
@@ -18,7 +18,7 @@ pub struct Manifest {
     #[serde(default)]
     pub skills: BTreeMap<String, SkillResource>,
 
-    /// WHS service configs
+    /// Service configs
     #[serde(default)]
     pub services: BTreeMap<String, ServiceConfig>,
 
@@ -27,7 +27,7 @@ pub struct Manifest {
     pub agents: BTreeMap<String, AgentResource>,
 }
 
-/// The package manifest
+/// The package manifest.
 #[derive(Serialize, Deserialize)]
 pub struct Package {
     /// Package name.
@@ -46,7 +46,7 @@ pub struct Package {
     pub keywords: Vec<String>,
 }
 
-/// A skill resource
+/// A skill resource.
 #[derive(Serialize, Deserialize)]
 pub struct SkillResource {
     /// Skill name (defaults to map key if empty)

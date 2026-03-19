@@ -1,9 +1,8 @@
-//! Walrus daemon — message central composing runtime, channels, and cron
+//! Crabtalk daemon — message central composing runtime, channels, and cron
 //! scheduling. Personal agent, local-first.
 
 pub mod config;
 pub mod daemon;
-pub mod ext;
 pub mod hook;
 pub mod service;
 
