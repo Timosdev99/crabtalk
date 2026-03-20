@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use wcore::McpServerConfig;
+use wcore::{CommandConfig, McpServerConfig};
 
 /// Crabtalk resource manifest.
 #[derive(Serialize, Deserialize)]
@@ -12,7 +12,7 @@ pub struct Manifest {
 
     /// MCP server configs
     #[serde(default)]
-    pub mcp_servers: BTreeMap<String, McpServerConfig>,
+    pub mcps: BTreeMap<String, McpServerConfig>,
 
     /// Skill resources
     #[serde(default)]
@@ -21,6 +21,10 @@ pub struct Manifest {
     /// Agent resources
     #[serde(default)]
     pub agents: BTreeMap<String, AgentResource>,
+
+    /// Command service metadata
+    #[serde(default)]
+    pub commands: BTreeMap<String, CommandConfig>,
 }
 
 /// The package manifest.

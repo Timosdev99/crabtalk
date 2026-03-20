@@ -20,6 +20,7 @@ struct HubFilter {
     mcps: BTreeSet<String>,
     skills: BTreeSet<String>,
     agents: BTreeSet<String>,
+    commands: BTreeSet<String>,
 }
 
 impl HubFilter {
@@ -28,6 +29,7 @@ impl HubFilter {
             mcps: BTreeSet::new(),
             skills: BTreeSet::new(),
             agents: BTreeSet::new(),
+            commands: BTreeSet::new(),
         };
         for raw in filters {
             if let Some((kind, name)) = raw.split_once(':') {
@@ -35,6 +37,7 @@ impl HubFilter {
                     "mcp" => &mut f.mcps,
                     "skill" => &mut f.skills,
                     "agent" => &mut f.agents,
+                    "command" => &mut f.commands,
                     _ => continue,
                 };
                 set.insert(name.to_string());
@@ -44,7 +47,10 @@ impl HubFilter {
     }
 
     fn is_empty(&self) -> bool {
-        self.mcps.is_empty() && self.skills.is_empty() && self.agents.is_empty()
+        self.mcps.is_empty()
+            && self.skills.is_empty()
+            && self.agents.is_empty()
+            && self.commands.is_empty()
     }
 
     fn wants_mcp(&self, name: &str) -> bool {
@@ -57,6 +63,10 @@ impl HubFilter {
 
     fn wants_agent(&self, name: &str) -> bool {
         self.is_empty() || self.agents.contains(name)
+    }
+
+    fn wants_command(&self, name: &str) -> bool {
+        self.is_empty() || self.commands.contains(name)
     }
 }
 
@@ -77,13 +87,15 @@ pub fn install(
             .lock()
             .await
             .start(DownloadKind::Hub, package.to_string());
-        yield DownloadEvent {
+        let event = DownloadEvent {
             event: Some(download_event::Event::Created(DownloadCreated {
                 id,
                 kind: DownloadKind::Hub as i32,
                 label: package.to_string(),
             })),
         };
+        yield event.clone();
+        registry.lock().await.broadcast(event);
 
         let filter = HubFilter::parse(&filters);
 
@@ -96,17 +108,15 @@ pub fn install(
 
         // Merge MCP servers.
         let wanted_mcps: Vec<_> = manifest
-            .mcp_servers
+            .mcps
             .iter()
             .filter(|(k, _)| filter.wants_mcp(k.as_str()))
             .collect();
         if !wanted_mcps.is_empty() {
-            let msg = "adding MCP servers…".to_string();
-            registry.lock().await.step(id, msg.clone());
-            yield DownloadEvent {
-                event: Some(download_event::Event::Step(DownloadStep { id, message: msg })),
-            };
-            merge_mcp_servers_filtered(&wanted_mcps)?;
+            let event = step_event(id, "adding MCP servers…");
+            yield event.clone();
+            registry.lock().await.broadcast(event);
+            merge_section_filtered("mcps", &wanted_mcps)?;
         }
 
         // Collect skill keys from wanted agents.
@@ -131,31 +141,34 @@ pub fn install(
             .collect();
 
         if !all_skill_keys.is_empty() {
-            let msg = "installing skills…".to_string();
-            registry.lock().await.step(id, msg.clone());
-            yield DownloadEvent {
-                event: Some(download_event::Event::Step(DownloadStep { id, message: msg })),
-            };
-            let cache_dir = CONFIG_DIR.join(".cache").join("skills");
+            let event = step_event(id, "installing skills…");
+            yield event.clone();
+            registry.lock().await.broadcast(event);
+
+            // Clone the source repo once, then copy per-skill subdirectories.
+            let slug = repo_slug(&manifest.package.repository);
+            if slug.is_empty() {
+                Err(anyhow::anyhow!("manifest has no repository URL for skill install"))?;
+            }
+            let repo_dir = CONFIG_DIR.join(".cache").join("repos").join(&slug);
+            std::fs::create_dir_all(repo_dir.parent().context("repo cache path has no parent")?)
+                .context("failed to create repo cache dir")?;
+            git_sync(&manifest.package.repository, &repo_dir)
+                .await
+                .with_context(|| format!("failed to sync repo {}", &manifest.package.repository))?;
+
             let skills_dir = CONFIG_DIR.join("skills");
-            std::fs::create_dir_all(&cache_dir).context("failed to create skill cache dir")?;
             std::fs::create_dir_all(&skills_dir).context("failed to create skills dir")?;
 
             for key in &all_skill_keys {
                 let skill = manifest.skills.get(*key).ok_or_else(|| {
                     anyhow::anyhow!("agent references skill '{key}' not found in [skills]")
                 })?;
-                let msg = format!("installing skill {key}…");
-                registry.lock().await.step(id, msg.clone());
-                yield DownloadEvent {
-                    event: Some(download_event::Event::Step(DownloadStep { id, message: msg })),
-                };
-                let cache_dest = cache_dir.join(key.as_str());
-                git_sync(&manifest.package.repository, &cache_dest)
-                    .await
-                    .with_context(|| format!("failed to sync skill repo for {key}"))?;
+                let event = step_event(id, &format!("installing skill {key}…"));
+                yield event.clone();
+                registry.lock().await.broadcast(event);
 
-                let src = cache_dest.join(skill.path.as_str());
+                let src = repo_dir.join(skill.path.as_str());
                 let dst = skills_dir.join(key.as_str());
                 if dst.exists() {
                     std::fs::remove_dir_all(&dst)
@@ -168,18 +181,31 @@ pub fn install(
 
         // Install agents (copy prompt .md files).
         if !wanted_agents.is_empty() {
-            let msg = "installing agents…".to_string();
-            registry.lock().await.step(id, msg.clone());
-            yield DownloadEvent {
-                event: Some(download_event::Event::Step(DownloadStep { id, message: msg })),
-            };
+            let event = step_event(id, "installing agents…");
+            yield event.clone();
+            registry.lock().await.broadcast(event);
             install_agents_filtered(scope, &wanted_agents)?;
         }
 
+        // Register commands (merge metadata into crab.toml).
+        let wanted_cmds: Vec<_> = manifest
+            .commands
+            .iter()
+            .filter(|(k, _)| filter.wants_command(k.as_str()))
+            .collect();
+        if !wanted_cmds.is_empty() {
+            let event = step_event(id, "registering commands…");
+            yield event.clone();
+            registry.lock().await.broadcast(event);
+            merge_section_filtered("commands", &wanted_cmds)?;
+        }
+
         registry.lock().await.complete(id);
-        yield DownloadEvent {
+        let event = DownloadEvent {
             event: Some(download_event::Event::Completed(DownloadCompleted { id })),
         };
+        yield event.clone();
+        registry.lock().await.broadcast(event);
     }
 }
 
@@ -199,13 +225,15 @@ pub fn uninstall(
             .lock()
             .await
             .start(DownloadKind::Hub, package.to_string());
-        yield DownloadEvent {
+        let event = DownloadEvent {
             event: Some(download_event::Event::Created(DownloadCreated {
                 id,
                 kind: DownloadKind::Hub as i32,
                 label: package.to_string(),
             })),
         };
+        yield event.clone();
+        registry.lock().await.broadcast(event);
 
         let filter = HubFilter::parse(&filters);
 
@@ -213,30 +241,40 @@ pub fn uninstall(
         let manifest = read_manifest(scope, name)?;
 
         let mcp_keys: Vec<_> = manifest
-            .mcp_servers
+            .mcps
             .keys()
             .filter(|k| filter.wants_mcp(k.as_str()))
             .collect();
         if !mcp_keys.is_empty() {
-            let msg = "removing MCP servers…".to_string();
-            registry.lock().await.step(id, msg.clone());
-            yield DownloadEvent {
-                event: Some(download_event::Event::Step(DownloadStep { id, message: msg })),
-            };
+            let event = step_event(id, "removing MCP servers…");
+            yield event.clone();
+            registry.lock().await.broadcast(event);
             remove_keys_from_section("mcps", &mcp_keys)?;
         }
 
-        let skill_keys: Vec<_> = manifest
+        // Collect agent-declared skill keys (mirrors install logic).
+        let wanted_agents: Vec<_> = manifest
+            .agents
+            .iter()
+            .filter(|(k, _)| filter.wants_agent(k.as_str()))
+            .collect();
+        let mut agent_skill_keys: BTreeSet<&String> = BTreeSet::new();
+        for (_, agent) in &wanted_agents {
+            for sk in &agent.skills {
+                agent_skill_keys.insert(sk);
+            }
+        }
+
+        let skill_keys: BTreeSet<&String> = manifest
             .skills
             .keys()
             .filter(|k| filter.wants_skill(k.as_str()))
+            .chain(agent_skill_keys.iter().copied())
             .collect();
         if !skill_keys.is_empty() {
-            let msg = "removing skills…".to_string();
-            registry.lock().await.step(id, msg.clone());
-            yield DownloadEvent {
-                event: Some(download_event::Event::Step(DownloadStep { id, message: msg })),
-            };
+            let event = step_event(id, "removing skills…");
+            yield event.clone();
+            registry.lock().await.broadcast(event);
             let skills_dir = CONFIG_DIR.join("skills");
             for key in &skill_keys {
                 let dst = skills_dir.join(key.as_str());
@@ -247,19 +285,12 @@ pub fn uninstall(
             }
         }
 
-        let agent_keys: Vec<_> = manifest
-            .agents
-            .keys()
-            .filter(|k| filter.wants_agent(k.as_str()))
-            .collect();
-        if !agent_keys.is_empty() {
-            let msg = "removing agents…".to_string();
-            registry.lock().await.step(id, msg.clone());
-            yield DownloadEvent {
-                event: Some(download_event::Event::Step(DownloadStep { id, message: msg })),
-            };
+        if !wanted_agents.is_empty() {
+            let event = step_event(id, "removing agents…");
+            yield event.clone();
+            registry.lock().await.broadcast(event);
             let agents_dir = CONFIG_DIR.join(wcore::paths::AGENTS_DIR);
-            for name in &agent_keys {
+            for (name, _) in &wanted_agents {
                 let dst = agents_dir.join(format!("{name}.md"));
                 if dst.exists() {
                     std::fs::remove_file(&dst)
@@ -268,10 +299,24 @@ pub fn uninstall(
             }
         }
 
+        let cmd_keys: Vec<_> = manifest
+            .commands
+            .keys()
+            .filter(|k| filter.wants_command(k.as_str()))
+            .collect();
+        if !cmd_keys.is_empty() {
+            let event = step_event(id, "removing commands…");
+            yield event.clone();
+            registry.lock().await.broadcast(event);
+            remove_keys_from_section("commands", &cmd_keys)?;
+        }
+
         registry.lock().await.complete(id);
-        yield DownloadEvent {
+        let event = DownloadEvent {
             event: Some(download_event::Event::Completed(DownloadCompleted { id })),
         };
+        yield event.clone();
+        registry.lock().await.broadcast(event);
     }
 }
 
@@ -338,8 +383,11 @@ fn read_manifest(scope: &str, name: &str) -> Result<manifest::Manifest> {
     toml::from_str(&content).with_context(|| format!("invalid manifest at {}", path.display()))
 }
 
-/// Merge selected MCP server entries into `crab.toml`.
-fn merge_mcp_servers_filtered(entries: &[(&String, &wcore::McpServerConfig)]) -> Result<()> {
+/// Merge serializable entries into a named section of `crab.toml`.
+fn merge_section_filtered<T: serde::Serialize>(
+    section: &str,
+    entries: &[(&String, &T)],
+) -> Result<()> {
     use toml_edit::DocumentMut;
 
     let config_path = CONFIG_DIR.join("crab.toml");
@@ -350,14 +398,14 @@ fn merge_mcp_servers_filtered(entries: &[(&String, &wcore::McpServerConfig)]) ->
         .with_context(|| format!("invalid TOML in {}", config_path.display()))?;
 
     let table = doc
-        .entry("mcps")
+        .entry(section)
         .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
         .as_table_mut()
-        .context("mcps is not a table")?;
+        .with_context(|| format!("{section} is not a table"))?;
 
     for (key, cfg) in entries {
         let doc = toml_edit::ser::to_document(cfg)
-            .with_context(|| format!("failed to serialize McpServerConfig for {key}"))?;
+            .with_context(|| format!("failed to serialize entry for {key}"))?;
         let item = toml_edit::Item::Table(doc.as_table().clone());
         table.insert(key.as_str(), item);
     }
@@ -410,6 +458,33 @@ fn install_agents_filtered(
         })?;
     }
     Ok(())
+}
+
+/// Build a step event.
+fn step_event(id: u64, message: &str) -> DownloadEvent {
+    DownloadEvent {
+        event: Some(download_event::Event::Step(DownloadStep {
+            id,
+            message: message.to_string(),
+        })),
+    }
+}
+
+/// Convert a repo URL to a filesystem-safe slug.
+///
+/// e.g. `https://github.com/microsoft/playwright-cli` → `github-com-microsoft-playwright-cli`
+fn repo_slug(url: &str) -> String {
+    url.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
 }
 
 /// Recursively copy `src` directory into `dst`.

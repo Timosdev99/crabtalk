@@ -51,13 +51,13 @@ pub struct HubPackage {
     #[arg(long)]
     pub mcp: Vec<String>,
 
-    /// Install only specific services by name.
-    #[arg(long)]
-    pub service: Vec<String>,
-
     /// Install only specific agents by name.
     #[arg(long)]
     pub agent: Vec<String>,
+
+    /// Install only specific commands by name.
+    #[arg(long)]
+    pub command: Vec<String>,
 }
 
 impl HubPackage {
@@ -70,11 +70,11 @@ impl HubPackage {
         for s in &self.mcp {
             out.push(format!("mcp:{s}"));
         }
-        for s in &self.service {
-            out.push(format!("service:{s}"));
-        }
         for s in &self.agent {
             out.push(format!("agent:{s}"));
+        }
+        for s in &self.command {
+            out.push(format!("command:{s}"));
         }
         out
     }
@@ -147,7 +147,7 @@ fn test_manifest(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Scan `[mcps.*]` and `[services.*]` in crab.toml for empty env values,
+/// Scan `[mcps.*]` in crab.toml for empty env values,
 /// prompt the user for each one, and write non-empty responses back.
 /// Returns `true` if any values were filled.
 fn prompt_empty_env_vars(config_path: &Path) -> Result<bool> {
@@ -156,7 +156,7 @@ fn prompt_empty_env_vars(config_path: &Path) -> Result<bool> {
     let theme = ColorfulTheme::default();
     let mut changed = false;
 
-    for (section, label) in [("mcps", "MCP"), ("services", "Service")] {
+    for (section, label) in [("mcps", "MCP")] {
         let Some(table) = doc.get_mut(section).and_then(|v| v.as_table_mut()) else {
             continue;
         };

@@ -6,4 +6,6 @@ pub mod cmd;
 pub mod config;
 pub mod engine;
 pub mod error;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod result;

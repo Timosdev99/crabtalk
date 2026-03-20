@@ -8,9 +8,7 @@ pub mod client;
 pub mod command;
 pub mod config;
 pub mod message;
-pub mod service;
 pub mod stream;
-pub mod telegram;
 
 pub use client::DaemonClient;
 pub use command::{BotCommand, COMMAND_HINT, parse_command};

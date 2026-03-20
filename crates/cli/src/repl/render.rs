@@ -1,4 +1,7 @@
-//! Streaming markdown renderer with syntax-highlighted code blocks.
+//! Streaming markdown renderer using termimad for text and syntect for code blocks.
+//!
+//! Output style matches Claude Code: `⏺` markers for text and tool calls,
+//! `⎿` for tool results, 2-space continuation indent.
 
 use console::{Style, Term, style};
 use heck::ToUpperCamelCase;
@@ -10,41 +13,53 @@ use syntect::{
     easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet,
     util::as_24_bit_terminal_escaped,
 };
+use termimad::MadSkin;
 
-// Reusable styles.
-static S_BOLD: LazyLock<Style> = LazyLock::new(|| Style::new().bold());
 static S_DIM: LazyLock<Style> = LazyLock::new(|| Style::new().dim());
-static S_ITALIC: LazyLock<Style> = LazyLock::new(|| Style::new().italic());
-static S_H1: LazyLock<Style> = LazyLock::new(|| Style::new().bold().cyan().bright());
-static S_H2: LazyLock<Style> = LazyLock::new(|| Style::new().bold().blue().bright());
-static S_H3: LazyLock<Style> = LazyLock::new(|| Style::new().bold().white().bright());
-static S_CODE: LazyLock<Style> = LazyLock::new(|| Style::new().cyan());
 static S_PROMPT: LazyLock<Style> = LazyLock::new(|| Style::new().bold().green().bright());
 static S_BANNER: LazyLock<Style> = LazyLock::new(|| Style::new().bold().yellow().bright());
 static S_GREEN: LazyLock<Style> = LazyLock::new(|| Style::new().green().bright());
 static S_RED: LazyLock<Style> = LazyLock::new(|| Style::new().red().bright());
-
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
-/// Leading marker for the first line of agent response.
-const MARKER: &str = "⏺ ";
-/// Padding for continuation lines (same visual width as MARKER).
-const PAD: &str = "  ";
+/// Skin with 2-space left margin (for text continuation after `⏺ `).
+static SKIN: LazyLock<MadSkin> = LazyLock::new(|| {
+    use termimad::crossterm::style::{Attribute, Color};
+    let mut skin = MadSkin::default_dark();
+    skin.paragraph.left_margin = 2;
+    skin.headers[0]
+        .compound_style
+        .set_fgbg(Color::Cyan, Color::Reset);
+    skin.headers[0].compound_style.add_attr(Attribute::Bold);
+    skin.headers[0].left_margin = 2;
+    skin.headers[1]
+        .compound_style
+        .set_fgbg(Color::Blue, Color::Reset);
+    skin.headers[1].compound_style.add_attr(Attribute::Bold);
+    skin.headers[1].left_margin = 2;
+    skin.headers[2]
+        .compound_style
+        .set_fgbg(Color::White, Color::Reset);
+    skin.headers[2].compound_style.add_attr(Attribute::Bold);
+    skin.headers[2].left_margin = 2;
+    skin.code_block.left_margin = 4;
+    skin
+});
 
-/// ANSI blink on.
+/// Text continuation indent (aligns with text after `⏺ `).
+const PAD: &str = "  ";
+/// Tool result indent (aligns with label text after `⏺ `).
+const TOOL_PAD: &str = "  ";
+
 const BLINK_ON: &str = "\x1b[5m";
-/// ANSI reset.
 const RESET: &str = "\x1b[0m";
-/// ANSI erase entire line.
 const ERASE_LINE: &str = "\x1b[2K";
 
-/// Terminal width with fallback.
 fn term_width() -> usize {
     Term::stdout().size().1 as usize
 }
 
-/// Renderer state tracking whether we're in normal text, a code block, or thinking.
 #[derive(Default)]
 enum RenderState {
     #[default]
@@ -53,22 +68,25 @@ enum RenderState {
         lang: String,
         code: String,
     },
+    Table(String),
     Thinking,
 }
 
-/// Streaming markdown renderer that buffers lines and emits styled output.
 pub struct MarkdownRenderer {
     line_buf: String,
     state: RenderState,
     out: BufWriter<Stdout>,
-    /// Whether the leading `⏺` has been printed for this response.
+    /// Whether we've printed the first `⏺` marker for this response.
     started: bool,
-    /// Whether the next `render_line` is the first line (MARKER already on stdout).
+    /// Whether the next text line is the very first (marker already on stdout).
     first_line: bool,
-    /// Stored tool labels for rewriting blinking → green/red.
+    /// Whether the last thing printed was a blank line (avoid double blanks).
+    last_was_blank: bool,
     tool_labels: Vec<String>,
-    /// Number of tool result lines printed (for cursor arithmetic).
     tool_result_lines: usize,
+    after_tool: bool,
+    /// Whether any tool result in the current batch indicated failure.
+    tool_failed: bool,
 }
 
 impl Default for MarkdownRenderer {
@@ -78,7 +96,6 @@ impl Default for MarkdownRenderer {
 }
 
 impl MarkdownRenderer {
-    /// Create a new renderer.
     pub fn new() -> Self {
         Self {
             line_buf: String::new(),
@@ -86,27 +103,36 @@ impl MarkdownRenderer {
             out: BufWriter::new(std::io::stdout()),
             started: false,
             first_line: false,
+            last_was_blank: false,
             tool_labels: Vec::new(),
             tool_result_lines: 0,
+            after_tool: false,
+            tool_failed: false,
         }
     }
 
-    /// Print the leading `⏺` marker if not yet printed.
+    /// Print the `⏺` marker at column 0 if this is the first text output.
     fn ensure_started(&mut self) {
         if !self.started {
-            let _ = write!(self.out, "{MARKER}");
+            let _ = write!(self.out, "⏺ ");
             self.started = true;
             self.first_line = true;
         }
     }
 
-    /// Push streamed text content, rendering complete lines.
     pub fn push_text(&mut self, chunk: &str) {
         if matches!(self.state, RenderState::Thinking) {
             self.state = RenderState::Normal;
         }
 
         self.ensure_started();
+
+        // After a tool block, print a new `⏺` marker for continuing text.
+        if self.after_tool {
+            let _ = write!(self.out, "⏺ ");
+            self.first_line = true;
+            self.after_tool = false;
+        }
 
         for ch in chunk.chars() {
             if ch == '\n' {
@@ -119,7 +145,6 @@ impl MarkdownRenderer {
         let _ = self.out.flush();
     }
 
-    /// Push thinking/reasoning content (dim + italic).
     pub fn push_thinking(&mut self, chunk: &str) {
         if !matches!(self.state, RenderState::Thinking) {
             self.state = RenderState::Thinking;
@@ -129,56 +154,60 @@ impl MarkdownRenderer {
         let _ = self.out.flush();
     }
 
-    /// Print tool call names with blinking `⏺` marker.
     pub fn push_tool_start(&mut self, calls: &[(String, String)]) {
         self.flush_thinking();
-        // Flush any pending text so it prints before the tool label.
         if !self.line_buf.is_empty() {
             let line = std::mem::take(&mut self.line_buf);
-            self.render_inline(&line);
+            self.render_md_line(&line);
+        }
+        if !self.last_was_blank {
             let _ = writeln!(self.out);
         }
-        let _ = writeln!(self.out);
         let _ = self.out.flush();
 
         self.tool_labels.clear();
+        self.tool_failed = false;
         for (name, args) in calls {
             let label = format_tool_label(name, args);
             let _ = writeln!(
                 self.out,
-                "{PAD}{BLINK_ON}⏺{RESET} {}",
+                "{BLINK_ON}⏺{RESET} {}",
                 style(&label).bold().dim()
             );
             self.tool_labels.push(label);
         }
-        let _ = writeln!(self.out);
         let _ = self.out.flush();
     }
 
-    /// Print a tool result as an indented tree under the tool labels.
-    ///
-    /// For bash results (JSON with stdout/stderr/exit_code), parse and show
-    /// stdout and stderr as separate indented sub-items. For other tools,
-    /// show the raw output indented.
     pub fn push_tool_result(&mut self, output: &str) {
-        let indent = "    ";
-        let lines = format_tool_result(output);
-        let mut count = 0;
-        for line in &lines {
-            let _ = writeln!(self.out, "{PAD}{indent}{}", S_DIM.apply_to(line));
-            count += 1;
+        if is_tool_failure(output) {
+            self.tool_failed = true;
         }
-        self.tool_result_lines += count;
+        let last_line = format_tool_tail(output);
+        let width = term_width().saturating_sub(TOOL_PAD.len() + 2);
+        let truncated = if last_line.len() > width {
+            format!("{}...", &last_line[..width.saturating_sub(3)])
+        } else {
+            last_line
+        };
+        let _ = writeln!(
+            self.out,
+            "{TOOL_PAD}{} {}",
+            S_DIM.apply_to("⎿"),
+            S_DIM.apply_to(&truncated)
+        );
+        let _ = writeln!(self.out);
+        self.tool_result_lines += 2;
         let _ = self.out.flush();
     }
 
-    /// Rewrite tool lines: green `⏺` on success, red on failure.
-    pub fn push_tool_done(&mut self, success: bool) {
+    pub fn push_tool_done(&mut self, _success: bool) {
         let count = self.tool_labels.len();
         if count == 0 {
             return;
         }
 
+        let success = !self.tool_failed;
         let _ = self.out.flush();
         let marker = if success {
             S_GREEN.apply_to("⏺")
@@ -186,33 +215,30 @@ impl MarkdownRenderer {
             S_RED.apply_to("⏺")
         };
 
-        // Move cursor up to the first tool line (+1 for trailing blank line + result lines).
-        let up = count + 1 + self.tool_result_lines;
+        let up = count + self.tool_result_lines;
         let _ = write!(self.out, "\x1b[{up}A");
         for label in &self.tool_labels {
             let _ = write!(
                 self.out,
-                "\r{ERASE_LINE}{PAD}{marker} {}\n",
+                "\r{ERASE_LINE}{marker} {}\n",
                 style(label).bold().dim()
             );
         }
-        // Skip past result lines and trailing blank line.
-        let skip = self.tool_result_lines + 1;
-        let _ = write!(self.out, "\x1b[{skip}B");
+        if self.tool_result_lines > 0 {
+            let _ = write!(self.out, "\x1b[{}B", self.tool_result_lines);
+        }
         let _ = self.out.flush();
         self.tool_labels.clear();
         self.tool_result_lines = 0;
+        self.after_tool = true;
     }
 
-    /// Flush remaining buffer on stream end.
     pub fn finish(&mut self) {
-        // If tools were still blinking, mark them red (interrupted/failed).
         if !self.tool_labels.is_empty() {
             self.push_tool_done(false);
         }
         self.flush_thinking();
 
-        // Flush remaining line buffer.
         if !self.line_buf.is_empty() {
             let line = std::mem::take(&mut self.line_buf);
             match &self.state {
@@ -221,13 +247,15 @@ impl MarkdownRenderer {
                 }
                 _ => {
                     self.ensure_started();
-                    let prefix = self.line_prefix();
-                    self.render_wrapped(&line, prefix);
+                    self.render_md_line(&line);
                 }
             }
         }
 
-        // If still in a code block, flush it.
+        if matches!(self.state, RenderState::Table(_)) {
+            self.flush_table();
+        }
+
         if let RenderState::CodeBlock { lang, code } = &self.state {
             let lang = lang.clone();
             let code = code.clone();
@@ -238,7 +266,6 @@ impl MarkdownRenderer {
         let _ = self.out.flush();
     }
 
-    /// Render a complete line based on current state.
     fn render_line(&mut self, line: &str) {
         match &mut self.state {
             RenderState::CodeBlock { lang: _, code } => {
@@ -260,6 +287,15 @@ impl MarkdownRenderer {
                     code.push('\n');
                 }
             }
+            RenderState::Table(buf) => {
+                if line.starts_with('|') || line.starts_with("|-") {
+                    buf.push_str(line);
+                    buf.push('\n');
+                } else {
+                    self.flush_table();
+                    self.render_line(line);
+                }
+            }
             RenderState::Normal | RenderState::Thinking => {
                 if let Some(rest) = line.strip_prefix("```") {
                     let lang = rest.trim().to_string();
@@ -268,113 +304,64 @@ impl MarkdownRenderer {
                         lang,
                         code: String::new(),
                     };
+                } else if line.starts_with('|') {
+                    let mut buf = String::new();
+                    buf.push_str(line);
+                    buf.push('\n');
+                    self.state = RenderState::Table(buf);
                 } else {
-                    let prefix = self.line_prefix();
-                    if let Some(rest) = line.strip_prefix("### ") {
-                        let _ = writeln!(self.out, "{prefix}{}", S_H3.apply_to(rest));
-                    } else if let Some(rest) = line.strip_prefix("## ") {
-                        let _ = writeln!(self.out, "{prefix}{}", S_H2.apply_to(rest));
-                    } else if let Some(rest) = line.strip_prefix("# ") {
-                        let _ = writeln!(self.out, "{prefix}{}", S_H1.apply_to(rest));
-                    } else if line == "---" || line == "***" || line == "___" {
-                        let w = term_width().min(60);
-                        let rule: String = "─".repeat(w);
-                        let _ = writeln!(self.out, "{prefix}{}", S_DIM.apply_to(rule));
-                    } else if let Some(rest) =
-                        line.strip_prefix("- ").or_else(|| line.strip_prefix("* "))
-                    {
-                        let first = format!("{prefix}  • ");
-                        self.render_wrapped(rest, &first);
-                    } else if is_ordered_list(line) {
-                        let (num_prefix, rest) = split_ordered_list(line);
-                        let first = format!("{prefix}  {num_prefix}");
-                        self.render_wrapped(rest, &first);
-                    } else if line.starts_with('.') {
-                        let first = format!("{prefix} ");
-                        self.render_wrapped(line, &first);
-                    } else {
-                        self.render_wrapped(line, prefix);
-                    }
+                    self.render_md_line(line);
                 }
             }
         }
     }
 
-    /// Render inline markdown formatting: **bold**, *italic*, `code`.
-    fn render_inline(&mut self, text: &str) {
-        let chars: Vec<char> = text.chars().collect();
-        let len = chars.len();
-        let mut i = 0;
-
-        while i < len {
-            if i + 1 < len
-                && chars[i] == '*'
-                && chars[i + 1] == '*'
-                && let Some(end) = find_closing(&chars, i + 2, "**")
-            {
-                let inner: String = chars[i + 2..end].iter().collect();
-                let _ = write!(self.out, "{}", S_BOLD.apply_to(&inner));
-                i = end + 2;
-                continue;
+    fn flush_table(&mut self) {
+        if let RenderState::Table(buf) = &self.state {
+            let buf = buf.clone();
+            let width = term_width().saturating_sub(PAD.len());
+            let rendered = format!("{}", SKIN.text(&buf, Some(width)));
+            for line in rendered.lines() {
+                let _ = writeln!(self.out, "{PAD}{line}");
             }
-            if chars[i] == '*'
-                && (i + 1 >= len || chars[i + 1] != '*')
-                && let Some(end) = find_closing_char(&chars, i + 1, '*')
-            {
-                let inner: String = chars[i + 1..end].iter().collect();
-                let _ = write!(self.out, "{}", S_ITALIC.apply_to(&inner));
-                i = end + 1;
-                continue;
-            }
-            if chars[i] == '`'
-                && let Some(end) = find_closing_char(&chars, i + 1, '`')
-            {
-                let inner: String = chars[i + 1..end].iter().collect();
-                let _ = write!(self.out, "{}", S_CODE.apply_to(&inner));
-                i = end + 1;
-                continue;
-            }
-            let _ = write!(self.out, "{}", chars[i]);
-            i += 1;
         }
+        self.state = RenderState::Normal;
     }
 
-    /// Word-wrap `text` to fit within `term_width`, rendering each physical line
-    /// with inline markdown. `first_prefix` is used for the first line; continuation
-    /// lines use `PAD`.
-    fn render_wrapped(&mut self, text: &str, first_prefix: &str) {
-        let width = term_width().saturating_sub(PAD.len());
-        let wrapped = textwrap::fill(text, width);
-        for (i, line) in wrapped.lines().enumerate() {
-            let p = if i == 0 { first_prefix } else { PAD };
-            let _ = write!(self.out, "{p}");
-            self.render_inline(line);
+    /// Render a single markdown line through termimad.
+    fn render_md_line(&mut self, line: &str) {
+        if line.is_empty() {
             let _ = writeln!(self.out);
+            self.last_was_blank = true;
+            self.first_line = false;
+            return;
         }
-    }
+        self.last_was_blank = false;
 
-    /// Return empty string on the first line (MARKER already printed), PAD otherwise.
-    fn line_prefix(&mut self) -> &'static str {
+        // First line content goes right after the `⏺ ` marker already on stdout.
         if self.first_line {
             self.first_line = false;
-            ""
-        } else {
-            PAD
+            // For the first line, render inline (no termimad block rendering)
+            // since `⏺ ` is already printed.
+            let _ = writeln!(self.out, "{line}");
+            return;
         }
+
+        let width = term_width();
+        let text = SKIN.text(line, Some(width));
+        let _ = write!(self.out, "{text}");
     }
 
-    /// Print the top border of a code block with optional language label.
     fn print_code_border_top(&mut self, lang: &str) {
-        let prefix = self.line_prefix();
+        self.first_line = false;
         let label = if lang.is_empty() {
             "┌─".to_string()
         } else {
             format!("┌ {lang} ─")
         };
-        let _ = writeln!(self.out, "{prefix}{}", S_DIM.apply_to(label));
+        let _ = writeln!(self.out, "{PAD}{}", S_DIM.apply_to(label));
     }
 
-    /// Syntax-highlight and emit a buffered code block.
     fn emit_code_block(&mut self, lang: &str, code: &str) {
         let syntax = if lang.is_empty() {
             SYNTAX_SET.find_syntax_plain_text()
@@ -403,7 +390,6 @@ impl MarkdownRenderer {
         let _ = writeln!(self.out, "{PAD}{}", S_DIM.apply_to("└─"));
     }
 
-    /// Flush a code block as raw text (used on cancel).
     fn flush_code_block_raw(&mut self, extra: &str) {
         let pipe = S_DIM.apply_to("│");
         if let RenderState::CodeBlock { code, .. } = &self.state {
@@ -416,7 +402,6 @@ impl MarkdownRenderer {
         self.state = RenderState::Normal;
     }
 
-    /// If in thinking state, transition back to normal.
     fn flush_thinking(&mut self) {
         if matches!(self.state, RenderState::Thinking) {
             self.state = RenderState::Normal;
@@ -424,12 +409,10 @@ impl MarkdownRenderer {
     }
 }
 
-/// Build the styled prompt string for rustyline.
 pub fn styled_prompt(agent: &str) -> String {
     format!("{} > ", S_PROMPT.apply_to(agent))
 }
 
-/// Build a welcome banner with optional model name.
 pub fn welcome_banner(model: Option<&str>) -> String {
     let model_part = match model {
         Some(m) => format!(" ({m})"),
@@ -449,58 +432,22 @@ pub fn welcome_banner(model: Option<&str>) -> String {
     )
 }
 
-/// Check if a line is an ordered list item (e.g. "1. foo").
-fn is_ordered_list(line: &str) -> bool {
-    let mut chars = line.chars();
-    if !chars.next().is_some_and(|c| c.is_ascii_digit()) {
-        return false;
+/// Check if tool output indicates failure.
+fn is_tool_failure(output: &str) -> bool {
+    // Bash JSON result with non-zero exit code.
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(output)
+        && let Some(code) = v.get("exit_code").and_then(|c| c.as_i64())
+    {
+        return code != 0;
     }
-    for c in chars {
-        if c == '.' {
-            return true;
-        }
-        if !c.is_ascii_digit() {
-            return false;
-        }
-    }
-    false
+    // Generic failure patterns.
+    output.starts_with("bash failed:")
+        || output.starts_with("permission denied:")
+        || output.starts_with("tool not available:")
+        || output.starts_with("invalid arguments:")
 }
 
-/// Split an ordered list item into prefix ("1. ") and rest.
-fn split_ordered_list(line: &str) -> (&str, &str) {
-    if let Some(dot) = line.find(". ") {
-        (&line[..dot + 2], &line[dot + 2..])
-    } else {
-        (line, "")
-    }
-}
-
-/// Find closing `**` in chars starting at `start`.
-fn find_closing(chars: &[char], start: usize, pattern: &str) -> Option<usize> {
-    let pat: Vec<char> = pattern.chars().collect();
-    let plen = pat.len();
-    for i in start..chars.len().saturating_sub(plen - 1) {
-        if chars[i..i + plen] == pat[..] {
-            return Some(i);
-        }
-    }
-    None
-}
-
-/// Find a single closing character in chars starting at `start`.
-fn find_closing_char(chars: &[char], start: usize, closing: char) -> Option<usize> {
-    (start..chars.len()).find(|&i| chars[i] == closing)
-}
-
-/// Format tool result output for display.
-///
-/// For bash JSON results, parse and show stdout/stderr as separate lines.
-/// For other tools, show the raw output truncated.
-fn format_tool_result(output: &str) -> Vec<String> {
-    let max_lines = 10;
-    let max_line_len = 120;
-
-    // Try to parse as bash JSON result.
+fn format_tool_tail(output: &str) -> String {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(output)
         && let (Some(stdout), Some(stderr), Some(exit_code)) = (
             v.get("stdout").and_then(|s| s.as_str()),
@@ -508,65 +455,29 @@ fn format_tool_result(output: &str) -> Vec<String> {
             v.get("exit_code").and_then(|c| c.as_i64()),
         )
     {
-        let mut lines = Vec::new();
-        if !stdout.is_empty() {
-            for line in stdout.lines().take(max_lines) {
-                let truncated = truncate_str(line, max_line_len);
-                lines.push(truncated);
-            }
-            if stdout.lines().count() > max_lines {
-                lines.push(format!(
-                    "... ({} more lines)",
-                    stdout.lines().count() - max_lines
-                ));
-            }
-        }
-        if !stderr.is_empty() {
-            lines.push(format!(
-                "stderr: {}",
-                truncate_str(stderr.lines().next().unwrap_or(""), max_line_len)
-            ));
-            for line in stderr.lines().skip(1).take(3) {
-                lines.push(format!("  {}", truncate_str(line, max_line_len)));
-            }
-        }
         if exit_code != 0 {
-            lines.push(format!("exit_code: {exit_code}"));
+            if let Some(last) = stderr.lines().last().filter(|l| !l.is_empty()) {
+                return last.to_string();
+            }
+            return format!("exit code: {exit_code}");
         }
-        if lines.is_empty() {
-            lines.push("(no output)".to_string());
+        if let Some(last) = stdout.lines().rev().find(|l| !l.is_empty()) {
+            return last.to_string();
         }
-        return lines;
+        if let Some(last) = stderr.lines().last().filter(|l| !l.is_empty()) {
+            return last.to_string();
+        }
+        return "(no output)".to_string();
     }
 
-    // Generic tool result — show first few lines.
-    let mut lines: Vec<String> = output
+    output
         .lines()
-        .take(max_lines)
-        .map(|l| truncate_str(l, max_line_len))
-        .collect();
-    if output.lines().count() > max_lines {
-        lines.push(format!(
-            "... ({} more lines)",
-            output.lines().count() - max_lines
-        ));
-    }
-    if lines.is_empty() {
-        lines.push("(no output)".to_string());
-    }
-    lines
+        .rev()
+        .find(|l| !l.is_empty())
+        .unwrap_or("(no output)")
+        .to_string()
 }
 
-/// Truncate a string to `max` characters, appending "..." if truncated.
-fn truncate_str(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max])
-    }
-}
-
-/// Format a tool label for display. For bash, show the command inline.
 fn format_tool_label(name: &str, args: &str) -> String {
     let pascal = name.to_upper_camel_case();
 
@@ -582,5 +493,11 @@ fn format_tool_label(name: &str, args: &str) -> String {
         return pascal;
     };
 
+    let max = term_width().saturating_sub(8);
+    let cmd = if cmd.len() > max {
+        format!("{}...", &cmd[..max])
+    } else {
+        cmd.to_string()
+    };
     format!("Bash({cmd})")
 }
