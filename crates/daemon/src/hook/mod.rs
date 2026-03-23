@@ -98,11 +98,34 @@ impl Hook for DaemonHook {
             ));
         }
         if let Ok(reg) = self.skills.registry.try_lock() {
-            let skills: Vec<&str> = reg.skills().iter().map(|s| s.name.as_str()).collect();
-            if !skills.is_empty() {
+            let all_skills = reg.skills();
+            // If the agent declares specific skills, show only those with
+            // descriptions. Otherwise show all skills.
+            let visible: Vec<_> = if config.skills.is_empty() {
+                all_skills.iter().collect()
+            } else {
+                all_skills
+                    .iter()
+                    .filter(|s| config.skills.iter().any(|n| n == &s.name))
+                    .collect()
+            };
+            if !visible.is_empty() {
+                let lines: Vec<String> = visible
+                    .iter()
+                    .map(|s| {
+                        if s.description.is_empty() {
+                            format!("- {}", s.name)
+                        } else {
+                            format!("- {}: {}", s.name, s.description)
+                        }
+                    })
+                    .collect();
                 hints.push(format!(
-                    "Skills: {}. Use the skill tool to load one by name.",
-                    skills.join(", ")
+                    "Skills:\n\
+                     When a <skill> tag appears in a message, it has been pre-loaded by the system. \
+                     Follow its instructions directly — do not announce or re-load it.\n\
+                     Use the skill tool to discover available skills or load one by name.\n{}",
+                    lines.join("\n")
                 ));
             }
         }
@@ -321,55 +344,56 @@ impl DaemonHook {
         config.tools = whitelist;
     }
 
-    /// Scan content for `/skill-name` tokens, load each skill found, and
-    /// append their bodies to the end of the message.
-    /// Tokens that don't match a skill are left as-is.
+    /// Resolve a leading `/skill-name` command at the start of the message.
+    /// Only the first token is checked — `/skill-name` must begin the message.
+    /// The slash token is stripped and the skill body is appended as a
+    /// `<skill>` tag. If no leading slash command is found, content is
+    /// returned unchanged.
     fn resolve_slash_skill(&self, agent: &str, content: &str) -> String {
-        let scope = self.scopes.get(agent);
-        let mut appended = Vec::new();
-        let mut rest = content;
+        let trimmed = content.trim_start();
+        let Some(rest) = trimmed.strip_prefix('/') else {
+            return content.to_owned();
+        };
 
-        while let Some(slash) = rest.find('/') {
-            rest = &rest[slash + 1..];
-            // Extract the skill name token: [a-z][a-z0-9-]*
-            let end = rest
-                .find(|c: char| !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '-')
-                .unwrap_or(rest.len());
-            let name = &rest[..end];
-            rest = &rest[end..];
+        // Extract the skill name token: [a-z][a-z0-9-]*
+        let end = rest
+            .find(|c: char| !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '-')
+            .unwrap_or(rest.len());
+        let name = &rest[..end];
+        let remainder = &rest[end..];
 
-            if name.is_empty() || name.contains("..") {
-                continue;
-            }
-            // Enforce skill scope.
-            if let Some(scope) = scope
-                && !scope.skills.is_empty()
-                && !scope.skills.iter().any(|s| s == name)
-            {
-                continue;
-            }
-            let mut found = false;
-            for dir in &self.skills.skill_dirs {
-                let skill_file = dir.join(name).join("SKILL.md");
-                let Ok(file_content) = std::fs::read_to_string(&skill_file) else {
-                    continue;
-                };
-                let Ok(skill) = skill::loader::parse_skill_md(&file_content) else {
-                    continue;
-                };
-                appended.push(skill.body);
-                found = true;
-                break;
-            }
-            if !found {
-                continue;
-            }
-        }
-
-        if appended.is_empty() {
+        if name.is_empty() || name.contains("..") {
             return content.to_owned();
         }
-        format!("{}\n\n{}", content, appended.join("\n\n"))
+
+        // Enforce skill scope.
+        if let Some(scope) = self.scopes.get(agent)
+            && !scope.skills.is_empty()
+            && !scope.skills.iter().any(|s| s == name)
+        {
+            return content.to_owned();
+        }
+
+        // Try to load the skill from disk.
+        for dir in &self.skills.skill_dirs {
+            let skill_file = dir.join(name).join("SKILL.md");
+            let Ok(file_content) = std::fs::read_to_string(&skill_file) else {
+                continue;
+            };
+            let Ok(skill) = skill::loader::parse_skill_md(&file_content) else {
+                continue;
+            };
+            // Strip the /skill-name token, keep the rest of the message.
+            let body = remainder.trim_start();
+            let block = format!("<skill name=\"{name}\">\n{}\n</skill>", skill.body);
+            return if body.is_empty() {
+                block
+            } else {
+                format!("{body}\n\n{block}")
+            };
+        }
+
+        content.to_owned()
     }
 
     /// Route a tool call by name to the appropriate handler.

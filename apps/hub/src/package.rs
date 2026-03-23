@@ -29,19 +29,42 @@ pub struct InstallResult {
 pub async fn install(
     package: &str,
     branch: Option<&str>,
+    path: Option<&Path>,
+    force: bool,
     on_step: impl Fn(&str),
 ) -> Result<InstallResult> {
     let (scope, name) = parse_package(package)?;
 
-    // Sync hub repo (clone or update).
-    on_step("syncing hub…");
-    let hub_dir = CONFIG_DIR.join("hub");
-    git_sync(CRABTALK_HUB, &hub_dir, branch)
-        .await
-        .context("failed to sync hub repo")?;
+    // Check if already installed.
+    if !force {
+        let manifest_path = CONFIG_DIR
+            .join(wcore::paths::PACKAGES_DIR)
+            .join(scope)
+            .join(format!("{name}.toml"));
+        if manifest_path.exists() {
+            on_step("already installed, use --force to overwrite");
+            return Ok(InstallResult {
+                setup: None,
+                repo_dir: None,
+            });
+        }
+    }
 
-    // Read the manifest from the hub repo.
-    let manifest = read_manifest(scope, name)?;
+    // Resolve the hub directory — use a local path or sync from remote.
+    let hub_dir = if let Some(p) = path {
+        anyhow::ensure!(p.exists(), "hub path {} does not exist", p.display());
+        p.to_path_buf()
+    } else {
+        on_step("syncing hub…");
+        let dir = CONFIG_DIR.join("hub");
+        git_sync(CRABTALK_HUB, &dir, branch)
+            .await
+            .context("failed to sync hub repo")?;
+        dir
+    };
+
+    // Read the manifest from the hub directory.
+    let manifest = read_manifest_from(&hub_dir, scope, name)?;
 
     // Copy manifest to packages/scope/name.toml.
     on_step("installing manifest…");
@@ -51,6 +74,7 @@ pub async fn install(
         .with_context(|| format!("failed to create {}", scope_dir.display()))?;
     let manifest_dst = scope_dir.join(format!("{name}.toml"));
     let manifest_src = hub_dir.join(scope).join(format!("{name}.toml"));
+
     std::fs::copy(&manifest_src, &manifest_dst).with_context(|| {
         format!(
             "failed to copy manifest {} → {}",
@@ -75,18 +99,32 @@ pub async fn install(
         None
     };
 
-    // Run command-type setup from the cached repo.
-    if let Some(Setup::Command { ref command }) = manifest.package.setup
+    // Run script-type setup from the cached repo.
+    if let Some(Setup::Script { ref script }) = manifest.package.setup
         && let Some(ref dir) = repo_dir
     {
-        on_step("running setup command…");
-        let status = tokio::process::Command::new("sh")
-            .args(["-c", command])
-            .current_dir(dir)
-            .status()
-            .await
-            .with_context(|| format!("failed to run setup command: {command}"))?;
-        anyhow::ensure!(status.success(), "setup command exited with {status}");
+        on_step("running setup script…");
+        let is_file = !script.contains(' ') && dir.join(script).is_file();
+        let status = if is_file {
+            tokio::process::Command::new("bash")
+                .arg(script)
+                .current_dir(dir)
+                .status()
+                .await
+        } else {
+            tokio::process::Command::new("bash")
+                .args(["-c", script])
+                .current_dir(dir)
+                .status()
+                .await
+        }
+        .with_context(|| format!("failed to run setup script: {script}"))?;
+        anyhow::ensure!(status.success(), "setup script exited with {status}");
+    }
+
+    // Auto-install command crates via `cargo install`.
+    if !manifest.commands.is_empty() {
+        install_commands(&manifest, &on_step).await?;
     }
 
     Ok(InstallResult {
@@ -104,6 +142,20 @@ pub async fn uninstall(package: &str, on_step: impl Fn(&str)) -> Result<()> {
 
     // Read manifest before deleting (need repository URL for cache cleanup).
     let manifest = read_manifest(scope, name).ok();
+
+    // Uninstall command crates (best-effort — don't fail if already removed).
+    if let Some(ref manifest) = manifest
+        && !manifest.commands.is_empty()
+        && let Ok(cargo) = find_cargo(&on_step).await
+    {
+        for (name, cmd) in &manifest.commands {
+            on_step(&format!("uninstalling command {name} ({})…", cmd.krate));
+            let _ = tokio::process::Command::new(&cargo)
+                .args(["uninstall", &cmd.krate])
+                .status()
+                .await;
+        }
+    }
 
     // Delete manifest from packages/.
     on_step("removing manifest…");
@@ -205,9 +257,72 @@ pub fn parse_package(package: &str) -> Result<(&str, &str)> {
     }
 }
 
-/// Read and deserialize the manifest for a package from the local hub repo.
+/// Install command crates from a manifest via `cargo install`.
+async fn install_commands(manifest: &manifest::Manifest, on_step: &impl Fn(&str)) -> Result<()> {
+    let cargo = find_cargo(on_step).await?;
+    for (name, cmd) in &manifest.commands {
+        on_step(&format!("installing command {name} ({})…", cmd.krate));
+        let status = tokio::process::Command::new(&cargo)
+            .args(["install", &cmd.krate])
+            .status()
+            .await
+            .with_context(|| format!("failed to run cargo install {}", cmd.krate))?;
+        anyhow::ensure!(
+            status.success(),
+            "cargo install {} failed with {status}",
+            cmd.krate
+        );
+    }
+    Ok(())
+}
+
+/// Locate cargo, installing rustup if needed. Returns the path to the cargo binary.
+async fn find_cargo(on_step: &impl Fn(&str)) -> Result<PathBuf> {
+    if let Some(cargo) = which("cargo") {
+        return Ok(cargo);
+    }
+
+    on_step("installing Rust via rustup…");
+    let status = tokio::process::Command::new("sh")
+        .args([
+            "-c",
+            "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y",
+        ])
+        .status()
+        .await
+        .context("failed to run rustup installer")?;
+    anyhow::ensure!(status.success(), "rustup installation failed");
+
+    // Rustup installs cargo to ~/.cargo/bin/cargo.
+    let home = std::env::var("HOME").unwrap_or_default();
+    let cargo = PathBuf::from(home).join(".cargo/bin/cargo");
+    anyhow::ensure!(
+        cargo.exists(),
+        "cargo not found at {} after rustup install",
+        cargo.display()
+    );
+    Ok(cargo)
+}
+
+/// Look for a binary on PATH.
+fn which(name: &str) -> Option<PathBuf> {
+    let path = std::env::var("PATH").unwrap_or_default();
+    for dir in path.split(':') {
+        let candidate = PathBuf::from(dir).join(name);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Read and deserialize a manifest from the default hub directory.
 pub fn read_manifest(scope: &str, name: &str) -> Result<manifest::Manifest> {
-    let hub_dir = CONFIG_DIR.join("hub");
+    read_manifest_from(&CONFIG_DIR.join("hub"), scope, name)
+}
+
+/// Read and deserialize a manifest from a given hub directory.
+pub fn read_manifest_from(hub_dir: &Path, scope: &str, name: &str) -> Result<manifest::Manifest> {
     let path = hub_dir.join(scope).join(format!("{name}.toml"));
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("cannot read manifest at {}", path.display()))?;

@@ -13,6 +13,9 @@ pub struct Hub {
     /// Branch of the hub repo to sync.
     #[arg(long)]
     pub branch: Option<String>,
+    /// Path to a local hub repo (skip remote sync).
+    #[arg(long)]
+    pub path: Option<PathBuf>,
     /// Hub subcommand.
     #[command(subcommand)]
     pub command: HubCommand,
@@ -41,6 +44,9 @@ pub struct HubTest {
 pub struct HubInstall {
     /// Package identifier in `scope/name` format.
     pub package: String,
+    /// Overwrite if already installed.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Package argument shared by uninstall.
@@ -57,21 +63,36 @@ impl Hub {
             return test_manifest(&t.path);
         }
 
-        let (pkg, is_install) = match self.command {
-            HubCommand::Install(p) => (p.package, true),
-            HubCommand::Uninstall(p) => (p.package, false),
+        let (pkg, force, is_install) = match self.command {
+            HubCommand::Install(p) => (p.package, p.force, true),
+            HubCommand::Uninstall(p) => (p.package, false, false),
             HubCommand::Test(_) => unreachable!(),
         };
 
         let on_step = |msg: &str| println!("  {msg}");
 
         if is_install {
-            let result = crabhub::package::install(&pkg, self.branch.as_deref(), on_step).await?;
+            let result = crabhub::package::install(
+                &pkg,
+                self.branch.as_deref(),
+                self.path.as_deref(),
+                force,
+                on_step,
+            )
+            .await?;
             println!("Done: {pkg}");
 
             // Reload daemon to pick up new components.
             let _ = runner.reload().await;
             println!("Daemon reloaded.");
+
+            // Check for conflicts with existing packages.
+            let config_dir = &*wcore::paths::CONFIG_DIR;
+            let (manifest, mut warnings) = wcore::resolve_manifests(config_dir);
+            warnings.extend(wcore::check_skill_conflicts(&manifest.skill_dirs));
+            for w in &warnings {
+                tracing::warn!("{w}");
+            }
 
             // Run prompt-type setup via inference.
             if let Some(Setup::Prompt { ref prompt }) = result.setup {
