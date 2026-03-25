@@ -109,6 +109,14 @@ impl Runner {
         })
     }
 
+    /// Create a new connection from existing connection info.
+    pub async fn connect_from(info: &ConnectionInfo) -> Result<Self> {
+        match info {
+            ConnectionInfo::Uds(path) => Self::connect(path).await,
+            ConnectionInfo::Tcp(port) => Self::connect_tcp(*port).await,
+        }
+    }
+
     /// Connection info for creating separate connections (e.g. for ReplyToAsk).
     pub fn conn_info(&self) -> &ConnectionInfo {
         &self.conn_info
@@ -125,6 +133,7 @@ impl Runner {
         cwd: Option<&'a Path>,
         new_chat: bool,
         resume_file: Option<String>,
+        sender: Option<String>,
     ) -> impl Stream<Item = Result<OutputChunk>> + Send + 'a {
         let cwd = cwd.map(|p| p.to_string_lossy().into_owned()).or_else(|| {
             std::env::current_dir()
@@ -136,7 +145,7 @@ impl Runner {
                 agent: agent.to_string(),
                 content: content.to_string(),
                 session: None,
-                sender: None,
+                sender,
                 cwd,
                 new_chat,
                 resume_file,
