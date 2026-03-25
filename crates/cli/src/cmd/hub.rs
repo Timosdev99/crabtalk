@@ -1,6 +1,9 @@
 //! Hub package management command.
 
-use crate::repl::{self, runner::Runner};
+use crate::{
+    cmd::auth::oauth,
+    repl::{self, runner::Runner},
+};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use crabhub::manifest::Manifest;
@@ -92,6 +95,36 @@ impl Hub {
             warnings.extend(wcore::check_skill_conflicts(&manifest.skill_dirs));
             for w in &warnings {
                 tracing::warn!("{w}");
+            }
+
+            // Offer OAuth login for MCPs that declare auth = true.
+            // Check resolved manifests (covers both fresh install and re-install).
+            for (name, mcp) in &manifest.mcps {
+                if mcp.auth
+                    && !wcore::paths::TOKENS_DIR
+                        .join(format!("{name}.json"))
+                        .exists()
+                {
+                    println!();
+                    println!("MCP '{name}' requires authentication.");
+                    let confirm = dialoguer::Confirm::new()
+                        .with_prompt("Authenticate now?")
+                        .default(true)
+                        .interact()
+                        .unwrap_or(false);
+                    if confirm {
+                        if let Err(e) = oauth::login(name).await {
+                            println!("Authentication failed: {e}");
+                            println!("You can retry later with: crabtalk auth login {name}");
+                        } else {
+                            // Reload again so daemon connects with the new token.
+                            let _ = runner.reload().await;
+                            println!("Daemon reloaded.");
+                        }
+                    } else {
+                        println!("Skipped. Run `crabtalk auth login {name}` when ready.");
+                    }
+                }
             }
 
             // Run prompt-type setup via inference.

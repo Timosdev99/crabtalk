@@ -46,7 +46,7 @@ impl Cli {
     pub async fn run(self) -> Result<()> {
         let socket_path = wcore::paths::SOCKET_PATH.clone();
         match self.command {
-            Command::Auth(cmd) => cmd.run(),
+            Command::Auth(cmd) => cmd.run().await,
             Command::Attach(cmd) => {
                 let runner = connect(cmd.tcp, &socket_path).await?;
                 cmd.run(runner).await
