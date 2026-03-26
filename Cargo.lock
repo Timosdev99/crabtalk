@@ -521,7 +521,7 @@ dependencies = [
 
 [[package]]
 name = "crabhub"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "anyhow",
  "crabtalk-core",
@@ -559,7 +559,7 @@ dependencies = [
 
 [[package]]
 name = "crabtalk"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -571,6 +571,7 @@ dependencies = [
  "crabtalk-command",
  "crabtalk-core",
  "crabtalk-daemon",
+ "crabtalk-runtime",
  "crabtalk-transport",
  "crossterm 0.28.1",
  "dialoguer",
@@ -595,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "crabtalk-command"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "anyhow",
  "axum",
@@ -612,7 +613,7 @@ dependencies = [
 
 [[package]]
 name = "crabtalk-command-codegen"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -622,7 +623,7 @@ dependencies = [
 
 [[package]]
 name = "crabtalk-core"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -644,23 +645,18 @@ dependencies = [
 
 [[package]]
 name = "crabtalk-daemon"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "anyhow",
  "async-stream",
- "async-trait",
- "chrono",
  "crabtalk-core",
  "crabtalk-model",
+ "crabtalk-runtime",
  "crabtalk-transport",
  "futures-core",
  "futures-util",
- "reqwest 0.13.2",
- "rmcp",
- "schemars 1.2.1",
  "serde",
  "serde_json",
- "serde_yml",
  "tokio",
  "toml",
  "toml_edit",
@@ -669,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "crabtalk-gateway"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "anyhow",
  "crabtalk-core",
@@ -685,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "crabtalk-model"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -705,7 +701,7 @@ dependencies = [
 
 [[package]]
 name = "crabtalk-outlook"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "anyhow",
  "axum",
@@ -727,8 +723,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "crabtalk-runtime"
+version = "0.0.15"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "crabtalk-core",
+ "crabtalk-model",
+ "reqwest 0.13.2",
+ "rmcp",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "serde_yml",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "crabtalk-search"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "anyhow",
  "axum",
@@ -754,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "crabtalk-telegram"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "anyhow",
  "clap",
@@ -772,7 +787,7 @@ dependencies = [
 
 [[package]]
 name = "crabtalk-transport"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -784,7 +799,7 @@ dependencies = [
 
 [[package]]
 name = "crabtalk-wechat"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "anyhow",
  "base64",
