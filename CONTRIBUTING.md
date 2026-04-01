@@ -41,34 +41,14 @@ Layer 4 ─ Adapters
 
 ## Boundary Contracts
 
-### Daemon — Runtime
+- **Runtime** — never initiates I/O. It only responds. No sockets, timers, or listeners.
+- **Daemon** — never interprets tool semantics. It only routes. Cron and config are daemon concerns (process-lifetime, not session-lifetime).
+- **Gateway** — no dependency on runtime or model. Adapter-centric, not agent-centric.
+- **Core** — defines traits and types only. If a core change pulls in runtime or daemon deps, the abstraction is wrong.
 
-The daemon constructs the runtime and feeds it messages. Tool calls come back
-through the event channel. `Host` is the seam between embedded and
-daemon modes.
-
-**Runtime never initiates I/O** — it only responds. If your feature needs to
-open a socket, schedule a timer, or listen for connections, it does not belong
-in the runtime.
-
-**Daemon never interprets tool semantics** — it only routes. If your feature
-needs to understand what a tool does or modify agent prompts, it does not belong
-in the daemon.
-
-Cron and config are daemon concerns — they're process-lifetime, not
-session-lifetime.
-
-### Gateway — Runtime
-
-Gateway does not depend on runtime or model. It's adapter-centric, not
-agent-centric. If your feature involves LLM logic, tool dispatch, or agent
-behavior, it does not belong in the gateway.
-
-### Core — Everything
-
-Core is the foundation. It defines traits and types but never implements
-server-specific behavior. If your change to core requires pulling in runtime
-or daemon dependencies, the abstraction is wrong.
+`Host` is the seam between daemon and runtime. The daemon constructs the
+runtime, feeds it messages, and receives tool calls back through the event
+channel.
 
 ## Data Flow
 
@@ -91,7 +71,29 @@ Client (CLI/Telegram/etc) → UDS/TCP → Daemon event loop
 - `ToolRequest` — single tool call with reply channel
 - Protocol — `ClientMessage` / `ServerMessage` (protobuf)
 
-## Features
+## External Dependencies
 
-Features and their design rationale are documented as RFCs in the
-[development book](docs/).
+LLM provider implementations (auth, request formatting, streaming) live in
+[`crabtalk/crabllm`](https://github.com/crabtalk/crabllm). The `model` crate
+wraps `crabllm-provider` — changes to provider internals should be contributed
+upstream.
+
+## Pull Requests
+
+- One logical change per PR. Don't mix features, refactors, and dependency changes.
+- Don't vendor dependencies. If you need to patch an upstream crate, PR the fix upstream.
+- Break work into reviewable commits — each commit should be one coherent change.
+- Keep commits focused — each commit should have a single reason to exist.
+  Mechanical changes (lockfile updates, renames, `cargo fmt`) can be large.
+- PR titles use conventional commits: `type(scope): description`.
+
+## Design
+
+Design decisions and their rationale are documented as RFCs in the
+[development book](https://crabtalk.github.io/crabtalk/)
+([source](docs/src/SUMMARY.md)). Read the ones relevant to the crate you're
+touching — they explain the why, not just the what.
+
+An RFC is needed when a change defines a public contract, protocol, or
+interface that external builders would implement against. Internal refactors,
+bug fixes, and enhancements don't need one.
