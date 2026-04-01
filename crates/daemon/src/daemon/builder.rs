@@ -102,7 +102,8 @@ impl<H: Host + 'static> Daemon<H> {
         event_tx: &DaemonEventSender,
         host: H,
     ) -> Result<Runtime<ProviderRegistry, Env<H>>> {
-        let (manifest, _warnings) = resolve_manifests(config_dir);
+        let (mut manifest, _warnings) = resolve_manifests(config_dir);
+        manifest.disabled = config.disabled.clone();
         let manager = build_providers(config, &manifest.disabled)?;
         let hook = build_env(config, config_dir, &manifest, host).await?;
         let tool_tx = build_tool_sender(event_tx);
@@ -129,15 +130,7 @@ fn build_providers(
         .filter(|(name, _)| !disabled.providers.contains(name))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    let registry = ProviderRegistry::from_providers(active_model.clone(), &providers)?;
-
-    // Verify the active model's provider wasn't disabled.
-    if registry.provider_name_for(&active_model).is_none() && !providers.is_empty() {
-        anyhow::bail!(
-            "active model '{}' requires a disabled provider — re-enable it or change the active model",
-            active_model
-        );
-    }
+    let registry = ProviderRegistry::from_providers(active_model, &providers)?;
 
     tracing::info!(
         "provider registry initialized — active model: {}",

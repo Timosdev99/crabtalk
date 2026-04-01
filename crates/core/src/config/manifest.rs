@@ -63,16 +63,11 @@ pub struct PackageMeta {
     pub setup: Option<Setup>,
 }
 
-/// Package setup — either a bash script or a prompt for inference.
+/// Package setup — a bash script run after install.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Setup {
-    /// Path to a bash script (relative to the repo root) run from the cached
-    /// repo directory.
-    Script { script: String },
-    /// Prompt sent to the daemon for inference. If the value ends with `.md`,
-    /// it is read as a file path relative to the repo root.
-    Prompt { prompt: String },
+pub struct Setup {
+    /// Bash script or command to run from the cached repo directory.
+    pub script: String,
 }
 
 impl ManifestConfig {
@@ -134,7 +129,7 @@ pub fn resolve_manifests(config_dir: &Path) -> (ResolvedManifest, Vec<String>) {
     // Load local manifest.
     let local_manifest_path = config_dir.join(LOCAL_DIR).join("CrabTalk.toml");
     if let Ok(Some(manifest)) = ManifestConfig::load(&local_manifest_path) {
-        resolved.disabled = manifest.disabled.clone();
+        // NOTE: disabled items are read from config.toml, not from manifests.
         merge_manifest(&mut resolved, &manifest, "local", &mut warnings);
     }
 
@@ -319,13 +314,12 @@ fn scan_skill_names_inner(dir: &Path, results: &mut Vec<String>) {
         }
 
         let skill_file = path.join("SKILL.md");
-        if skill_file.exists() {
-            if let Some(name) = extract_skill_name(&skill_file) {
-                results.push(name);
-            }
-        } else {
-            scan_skill_names_inner(&path, results);
+        if skill_file.exists()
+            && let Some(name) = extract_skill_name(&skill_file)
+        {
+            results.push(name);
         }
+        scan_skill_names_inner(&path, results);
     }
 }
 

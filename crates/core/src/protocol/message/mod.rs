@@ -3,8 +3,8 @@
 mod convert;
 
 pub use crate::protocol::proto::{
-    AgentEventKind, ProviderKind as ProtoProviderKind, client_message, hub_event, server_message,
-    stream_event,
+    AgentEventKind, ProviderKind as ProtoProviderKind, SourceKind, client_message, hub_event,
+    server_message, stream_event,
 };
 pub use crate::protocol::proto::{
     AgentEventMsg, AgentInfo, AgentList, AskOption, AskQuestion, AskUserEvent, ClientMessage,
@@ -12,12 +12,13 @@ pub use crate::protocol::proto::{
     CreateCronMsg, CronInfo, CronList, DaemonStats, DeleteAgentMsg, DeleteCronMsg,
     DeleteProviderMsg, ErrorMsg, GetAgentMsg, GetConfig, GetStats, HubDone, HubEvent,
     HubSetupOutput, HubStep, HubWarning, InstallPackageMsg, KillMsg, ListAgentsMsg,
-    ListConversationsMsg, ListCronsMsg, ListMcpsMsg, ListPackagesMsg, ListProviderPresetsMsg,
-    ListProvidersMsg, ListSkillsMsg, McpInfo, McpList, PackageInfo, PackageList, Ping, Pong,
-    ProviderInfo, ProviderList, ProviderPresetInfo, ProviderPresetList, ReplyToAsk, ResourceKind,
-    SendMsg, SendResponse, ServerMessage, ServiceLogOutput, ServiceLogsMsg, SessionInfo,
-    SessionList, SetActiveModelMsg, SetEnabledMsg, SetLocalMcpsMsg, SetProviderMsg, SkillInfo,
-    SkillList, StartServiceMsg, StopServiceMsg, StreamChunk, StreamEnd, StreamEvent, StreamMsg,
-    StreamStart, StreamThinking, SubscribeEvents, TokenUsage, ToolCallInfo, ToolResultEvent,
-    ToolStartEvent, ToolsCompleteEvent, UninstallPackageMsg, UpdateAgentMsg,
+    ListConversationsMsg, ListCronsMsg, ListMcpsMsg, ListModelsMsg, ListPackagesMsg,
+    ListProviderPresetsMsg, ListProvidersMsg, ListSkillsMsg, McpInfo, McpList, ModelInfo,
+    ModelList, PackageInfo, PackageList, Ping, Pong, ProviderInfo, ProviderList,
+    ProviderPresetInfo, ProviderPresetList, ReplyToAsk, ResourceKind, SendMsg, SendResponse,
+    ServerMessage, ServiceLogOutput, ServiceLogsMsg, SessionInfo, SessionList, SetActiveModelMsg,
+    SetEnabledMsg, SetLocalMcpsMsg, SetProviderMsg, SkillInfo, SkillList, StartServiceMsg,
+    StopServiceMsg, StreamChunk, StreamEnd, StreamEvent, StreamMsg, StreamStart, StreamThinking,
+    SubscribeEvents, TokenUsage, ToolCallInfo, ToolResultEvent, ToolStartEvent, ToolsCompleteEvent,
+    UninstallPackageMsg, UpdateAgentMsg,
 };

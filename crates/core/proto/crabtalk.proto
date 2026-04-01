@@ -40,6 +40,8 @@ message ClientMessage {
     ListSkillsMsg list_skills = 23;
     // Enable/disable
     SetEnabledMsg set_enabled = 35;
+    // Models
+    ListModelsMsg list_models = 36;
     // Services
     StartServiceMsg start_service = 24;
     StopServiceMsg stop_service = 25;
@@ -145,11 +147,20 @@ message ListPackagesMsg {}
 
 message ListSkillsMsg {}
 
+message ListModelsMsg {}
+
 enum ResourceKind {
   RESOURCE_KIND_UNKNOWN = 0;
   PROVIDER = 1;
   MCP = 2;
   SKILL = 3;
+}
+
+enum SourceKind {
+  SOURCE_KIND_UNKNOWN = 0;
+  LOCAL = 1;
+  PACKAGE = 2;
+  EXTERNAL = 3;
 }
 
 message SetEnabledMsg {
@@ -225,6 +236,8 @@ message ServerMessage {
     PackageList package_list = 14;
     // Skills
     SkillList skill_list = 15;
+    // Models
+    ModelList model_list = 22;
     // Services
     ServiceLogOutput service_log_output = 16;
     // Cron
@@ -397,7 +410,15 @@ message CronList {
 message AgentInfo {
   string name = 1;
   string description = 2;
-  string config = 3;
+  string config = 3; // deprecated: always empty, use typed fields below
+  optional string model = 4;
+  uint32 max_iterations = 5;
+  bool thinking = 6;
+  repeated string members = 7;
+  repeated string skills = 8;
+  repeated string mcps = 9;
+  optional uint32 compact_threshold = 10;
+  uint32 compact_tool_max_len = 11;
 }
 
 message AgentList {
@@ -431,10 +452,24 @@ message ServiceLogOutput {
 message SkillInfo {
   string name = 1;
   bool enabled = 2;
+  string source = 3;
+  SourceKind source_kind = 4;
 }
 
 message SkillList {
   repeated SkillInfo skills = 1;
+}
+
+message ModelInfo {
+  string name = 1;
+  string provider = 2;
+  bool active = 3;
+  bool enabled = 4;
+  ProviderKind kind = 5;
+}
+
+message ModelList {
+  repeated ModelInfo models = 1;
 }
 
 message ConversationInfo {
@@ -462,6 +497,7 @@ message McpInfo {
   string source = 7;
   bool auto_restart = 8;
   bool enabled = 9;
+  SourceKind source_kind = 10;
 }
 
 message McpList {

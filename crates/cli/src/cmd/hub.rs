@@ -76,12 +76,12 @@ impl Hub {
                     match event? {
                         hub_event::Event::Step(s) => println!("  {}", s.message),
                         hub_event::Event::Warning(w) => eprintln!("  warning: {}", w.message),
-                        hub_event::Event::SetupOutput(o) => print!("{}", o.content),
                         hub_event::Event::Done(d) => {
                             if !d.error.is_empty() {
                                 anyhow::bail!("{}", d.error);
                             }
                         }
+                        _ => {}
                     }
                 }
                 println!("Done: {}", p.package);
@@ -92,12 +92,12 @@ impl Hub {
                     match event? {
                         hub_event::Event::Step(s) => println!("  {}", s.message),
                         hub_event::Event::Warning(w) => eprintln!("  warning: {}", w.message),
-                        hub_event::Event::SetupOutput(o) => print!("{}", o.content),
                         hub_event::Event::Done(d) => {
                             if !d.error.is_empty() {
                                 anyhow::bail!("{}", d.error);
                             }
                         }
+                        _ => {}
                     }
                 }
                 println!("Done: {}", p.package);

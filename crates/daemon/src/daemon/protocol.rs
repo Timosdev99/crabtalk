@@ -13,12 +13,12 @@ use wcore::protocol::{
     api::Server,
     message::{
         AgentEventMsg, AgentInfo, AskOption, AskQuestion, AskUserEvent, ConversationInfo,
-        CreateAgentMsg, CreateCronMsg, CronInfo, CronList, DaemonStats, HubDone, HubEvent,
-        HubSetupOutput, HubStep, HubWarning, InstallPackageMsg, McpInfo, PackageInfo, ProviderInfo,
-        ProviderPresetInfo, ResourceKind, SendMsg, SendResponse, SessionInfo, SkillInfo,
-        StreamChunk, StreamEnd, StreamEvent, StreamMsg, StreamStart, StreamThinking, TokenUsage,
-        ToolCallInfo, ToolResultEvent, ToolStartEvent, ToolsCompleteEvent, UpdateAgentMsg,
-        hub_event, stream_event,
+        CreateAgentMsg, CreateCronMsg, CronInfo, CronList, DaemonStats, HubDone, HubEvent, HubStep,
+        HubWarning, InstallPackageMsg, McpInfo, ModelInfo, PackageInfo, ProtoProviderKind,
+        ProviderInfo, ProviderPresetInfo, ResourceKind, SendMsg, SendResponse, SessionInfo,
+        SkillInfo, SourceKind, StreamChunk, StreamEnd, StreamEvent, StreamMsg, StreamStart,
+        StreamThinking, TokenUsage, ToolCallInfo, ToolResultEvent, ToolStartEvent,
+        ToolsCompleteEvent, UpdateAgentMsg, hub_event, stream_event,
     },
 };
 use wcore::{AgentEvent, AgentStep};
@@ -301,19 +301,11 @@ impl<H: Host + 'static> Server for Daemon<H> {
 
     async fn list_agents(&self) -> Result<Vec<AgentInfo>> {
         let rt = self.runtime.read().await.clone();
-        let agents = rt.agents();
-        agents
+        Ok(rt
+            .agents()
             .into_iter()
-            .map(|config| {
-                let json =
-                    serde_json::to_string(&config).context("failed to serialize agent config")?;
-                Ok(AgentInfo {
-                    name: config.name,
-                    description: config.description,
-                    config: json,
-                })
-            })
-            .collect()
+            .map(|c| agent_config_to_info(&c))
+            .collect())
     }
 
     async fn get_agent(&self, name: String) -> Result<AgentInfo> {
@@ -321,12 +313,7 @@ impl<H: Host + 'static> Server for Daemon<H> {
         let config = rt
             .agent(&name)
             .ok_or_else(|| anyhow::anyhow!("agent '{name}' not found"))?;
-        let json = serde_json::to_string(&config).context("failed to serialize agent config")?;
-        Ok(AgentInfo {
-            name: config.name,
-            description: config.description,
-            config: json,
-        })
+        Ok(agent_config_to_info(&config))
     }
 
     async fn create_agent(&self, req: CreateAgentMsg) -> Result<AgentInfo> {
@@ -371,7 +358,7 @@ impl<H: Host + 'static> Server for Daemon<H> {
     async fn list_providers(&self) -> Result<Vec<ProviderInfo>> {
         let rt = self.runtime.read().await.clone();
         let config = self.load_config()?;
-        let (manifest, _) = wcore::resolve_manifests(&self.config_dir);
+        let (manifest, _) = self.resolve_manifests()?;
         Ok(config
             .provider
             .iter()
@@ -444,15 +431,14 @@ impl<H: Host + 'static> Server for Daemon<H> {
                     }
                 }
             }
-            let install_result = task_result
-                .context("install task panicked")??;
+            task_result.context("install task panicked")??;
 
             // Reload daemon to pick up new components.
             yield hub_step("reloading daemon…");
             daemon.reload().await?;
 
             // Conflict and auth warnings.
-            let (manifest, mut warnings) = wcore::resolve_manifests(&daemon.config_dir);
+            let (manifest, mut warnings) = daemon.resolve_manifests()?;
             warnings.extend(wcore::check_skill_conflicts(&manifest.skill_dirs));
             for w in &warnings {
                 yield hub_warning(w);
@@ -466,44 +452,6 @@ impl<H: Host + 'static> Server for Daemon<H> {
             }
 
             yield hub_step("configure env vars in config.toml [env] section if needed");
-
-            // Setup::Prompt — run inference through the runtime.
-            if let Some(wcore::Setup::Prompt { ref prompt }) = install_result.setup {
-                let prompt_text = if prompt.ends_with(".md") {
-                    let repo_dir = install_result.repo_dir.as_ref()
-                        .context("prompt setup requires a repository but none was cloned")?;
-                    let raw = tokio::fs::read_to_string(repo_dir.join(prompt))
-                        .await
-                        .with_context(|| format!("failed to read setup prompt: {prompt}"))?;
-                    raw.replace("<REPO_DIR>", &repo_dir.display().to_string())
-                } else {
-                    prompt.clone()
-                };
-
-                yield hub_step("running setup…");
-                let rt = daemon.runtime.read().await.clone();
-                let session_id = rt
-                    .create_session(wcore::paths::DEFAULT_AGENT, "hub-setup")
-                    .await?;
-                let stream = rt.stream_to(session_id, &prompt_text, "hub-setup");
-                futures_util::pin_mut!(stream);
-                while let Some(event) = stream.next().await {
-                    match event {
-                        AgentEvent::TextDelta(text) => {
-                            yield hub_setup_output(&text);
-                        }
-                        AgentEvent::Done(resp) => {
-                            if let wcore::AgentStopReason::Error(ref e) = resp.stop_reason {
-                                yield hub_done(e);
-                                return;
-                            }
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
             yield hub_done("");
         }
     }
@@ -567,6 +515,7 @@ impl<H: Host + 'static> Server for Daemon<H> {
     }
 
     async fn list_mcps(&self) -> Result<Vec<McpInfo>> {
+        let config = self.load_config()?;
         let mut mcps = Vec::new();
 
         // Local MCPs from CrabTalk.toml.
@@ -574,16 +523,12 @@ impl<H: Host + 'static> Server for Daemon<H> {
             .config_dir
             .join(wcore::paths::LOCAL_DIR)
             .join("CrabTalk.toml");
-        let disabled_mcps = match wcore::ManifestConfig::load(&manifest_path) {
-            Ok(Some(local)) => {
-                for (name, cfg) in &local.mcps {
-                    let enabled = !local.disabled.mcps.contains(name);
-                    mcps.push(mcp_to_info(name, cfg, "local", enabled));
-                }
-                local.disabled.mcps
+        if let Ok(Some(local)) = wcore::ManifestConfig::load(&manifest_path) {
+            for (name, cfg) in &local.mcps {
+                let enabled = !config.disabled.mcps.contains(name);
+                mcps.push(mcp_to_info(name, cfg, "local", SourceKind::Local, enabled));
             }
-            _ => Vec::new(),
-        };
+        }
 
         // Hub-installed MCPs from packages.
         for (pkg_id, pkg_manifest) in scan_package_manifests(&self.config_dir) {
@@ -591,9 +536,15 @@ impl<H: Host + 'static> Server for Daemon<H> {
                 if mcps.iter().any(|m| m.name == *name) {
                     continue; // local wins
                 }
-                let enabled = !disabled_mcps.contains(name);
+                let enabled = !config.disabled.mcps.contains(name);
                 let cfg = mcp_res.to_server_config();
-                mcps.push(mcp_to_info(name, &cfg, &pkg_id, enabled));
+                mcps.push(mcp_to_info(
+                    name,
+                    &cfg,
+                    &pkg_id,
+                    SourceKind::Package,
+                    enabled,
+                ));
             }
         }
 
@@ -713,8 +664,8 @@ impl<H: Host + 'static> Server for Daemon<H> {
             .unwrap_or_default();
         let rt = self.runtime.read().await.clone();
         let active = rt.model.provider_name_for(&name).is_some_and(|n| n == name);
-        let (manifest, _) = wcore::resolve_manifests(&self.config_dir);
-        let enabled = !manifest.disabled.providers.contains(&name);
+        let config = self.load_config()?;
+        let enabled = !config.disabled.providers.contains(&name);
         Ok(ProviderInfo {
             name,
             active,
@@ -798,18 +749,71 @@ impl<H: Host + 'static> Server for Daemon<H> {
     }
 
     async fn list_skills(&self) -> Result<Vec<SkillInfo>> {
-        let (manifest, _) = wcore::resolve_manifests(&self.config_dir);
-        let mut names = std::collections::BTreeSet::new();
+        let (manifest, _) = self.resolve_manifests()?;
+        let local_skills_dir = self.config_dir.join(wcore::paths::SKILLS_DIR);
+
+        // Reverse-lookup: dir path → package id.
+        let dir_to_pkg: std::collections::BTreeMap<_, _> = manifest
+            .package_skill_dirs
+            .iter()
+            .map(|(id, dir)| (dir.clone(), id.clone()))
+            .collect();
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut skills = Vec::new();
+
         for dir in &manifest.skill_dirs {
-            names.extend(wcore::scan_skill_names(dir));
-        }
-        Ok(names
-            .into_iter()
-            .map(|name| {
+            let (source, source_kind) = if *dir == local_skills_dir {
+                ("local".to_string(), SourceKind::Local)
+            } else if let Some(pkg_id) = dir_to_pkg.get(dir) {
+                (pkg_id.clone(), SourceKind::Package)
+            } else {
+                let name = dir
+                    .components()
+                    .rev()
+                    .nth(1)
+                    .and_then(|c| c.as_os_str().to_str())
+                    .and_then(|s| s.strip_prefix('.'))
+                    .unwrap_or("external");
+                (name.to_string(), SourceKind::External)
+            };
+
+            for name in wcore::scan_skill_names(dir) {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
                 let enabled = !manifest.disabled.skills.contains(&name);
-                SkillInfo { name, enabled }
-            })
-            .collect())
+                skills.push(SkillInfo {
+                    name,
+                    enabled,
+                    source: source.clone(),
+                    source_kind: source_kind.into(),
+                });
+            }
+        }
+        Ok(skills)
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+        let rt = self.runtime.read().await.clone();
+        let config = self.load_config()?;
+        let active_model = rt.model.active_model_name().unwrap_or_default();
+
+        let mut models = Vec::new();
+        for (provider_name, def) in &config.provider {
+            let enabled = !config.disabled.providers.contains(provider_name);
+            let kind: i32 = ProtoProviderKind::from(def.kind).into();
+            for model_name in &def.models {
+                models.push(ModelInfo {
+                    name: model_name.clone(),
+                    provider: provider_name.clone(),
+                    active: *model_name == active_model,
+                    enabled,
+                    kind,
+                });
+            }
+        }
+        Ok(models)
     }
 
     async fn set_enabled(&self, kind: ResourceKind, name: String, enabled: bool) -> Result<()> {
@@ -830,23 +834,12 @@ impl<H: Host + 'static> Server for Daemon<H> {
             }
         }
 
-        let manifest_path = self
-            .config_dir
-            .join(wcore::paths::LOCAL_DIR)
-            .join("CrabTalk.toml");
-        let local_dir = self.config_dir.join(wcore::paths::LOCAL_DIR);
-        std::fs::create_dir_all(&local_dir)
-            .with_context(|| format!("cannot create {}", local_dir.display()))?;
-
-        let content = if manifest_path.exists() {
-            std::fs::read_to_string(&manifest_path)
-                .with_context(|| format!("cannot read {}", manifest_path.display()))?
-        } else {
-            String::new()
-        };
+        let config_path = self.config_dir.join(wcore::paths::CONFIG_FILE);
+        let content = std::fs::read_to_string(&config_path)
+            .with_context(|| format!("cannot read {}", config_path.display()))?;
         let mut doc: DocumentMut = content
             .parse()
-            .with_context(|| format!("invalid TOML in {}", manifest_path.display()))?;
+            .with_context(|| format!("invalid TOML in {}", config_path.display()))?;
 
         if doc.get("disabled").is_none() {
             doc.insert("disabled", toml_edit::Item::Table(toml_edit::Table::new()));
@@ -877,8 +870,8 @@ impl<H: Host + 'static> Server for Daemon<H> {
             arr.push(&name);
         }
 
-        std::fs::write(&manifest_path, doc.to_string())
-            .with_context(|| format!("failed to write {}", manifest_path.display()))?;
+        std::fs::write(&config_path, doc.to_string())
+            .with_context(|| format!("failed to write {}", config_path.display()))?;
         self.reload().await
     }
 
@@ -1029,6 +1022,14 @@ impl<H: Host + 'static> Daemon<H> {
         crate::DaemonConfig::load(&self.config_dir.join(wcore::paths::CONFIG_FILE))
     }
 
+    /// Resolve manifests and apply disabled items from config.toml.
+    fn resolve_manifests(&self) -> Result<(wcore::ResolvedManifest, Vec<String>)> {
+        let config = self.load_config()?;
+        let (mut manifest, warnings) = wcore::resolve_manifests(&self.config_dir);
+        manifest.disabled = config.disabled;
+        Ok((manifest, warnings))
+    }
+
     /// Look up a command service by name from installed package manifests.
     fn find_command_service(&self, name: &str) -> Result<crabhub::manifest::CommandConfig> {
         for (_, manifest) in scan_package_manifests(&self.config_dir) {
@@ -1114,14 +1115,6 @@ fn hub_warning(message: &str) -> HubEvent {
     HubEvent {
         event: Some(hub_event::Event::Warning(HubWarning {
             message: message.to_string(),
-        })),
-    }
-}
-
-fn hub_setup_output(content: &str) -> HubEvent {
-    HubEvent {
-        event: Some(hub_event::Event::SetupOutput(HubSetupOutput {
-            content: content.to_string(),
         })),
     }
 }
@@ -1273,7 +1266,13 @@ fn mtime_to_label(mtime: std::time::SystemTime, today: chrono::NaiveDate) -> Str
     }
 }
 
-fn mcp_to_info(name: &str, cfg: &wcore::McpServerConfig, source: &str, enabled: bool) -> McpInfo {
+fn mcp_to_info(
+    name: &str,
+    cfg: &wcore::McpServerConfig,
+    source: &str,
+    source_kind: SourceKind,
+    enabled: bool,
+) -> McpInfo {
     McpInfo {
         name: name.to_string(),
         command: cfg.command.clone(),
@@ -1288,6 +1287,23 @@ fn mcp_to_info(name: &str, cfg: &wcore::McpServerConfig, source: &str, enabled: 
         source: source.to_string(),
         auto_restart: cfg.auto_restart,
         enabled,
+        source_kind: source_kind.into(),
+    }
+}
+
+fn agent_config_to_info(config: &wcore::AgentConfig) -> AgentInfo {
+    AgentInfo {
+        name: config.name.clone(),
+        description: config.description.clone(),
+        config: String::new(),
+        model: config.model.clone(),
+        max_iterations: config.max_iterations as u32,
+        thinking: config.thinking,
+        members: config.members.clone(),
+        skills: config.skills.clone(),
+        mcps: config.mcps.clone(),
+        compact_threshold: config.compact_threshold.map(|t| t as u32),
+        compact_tool_max_len: config.compact_tool_max_len as u32,
     }
 }
 
