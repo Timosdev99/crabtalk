@@ -17,8 +17,15 @@ use std::{
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use wcore::{
     AgentEvent,
-    protocol::message::{AgentEventKind, AgentEventMsg, ClientMessage, SendMsg, server_message},
+    protocol::message::{
+        AgentEventKind, AgentEventMsg, ClientMessage, SendMsg, ToolCallInfo, server_message,
+    },
 };
+
+/// Tool result output is truncated to this many bytes in the broadcast.
+/// Keeps the firehose lightweight while still giving rich UIs enough
+/// content to render meaningful previews.
+const MAX_TOOL_OUTPUT_BROADCAST: usize = 2048;
 
 /// Timeout for waiting on user reply (5 minutes).
 const ASK_USER_TIMEOUT: Duration = Duration::from_secs(300);
@@ -162,44 +169,81 @@ impl Host for DaemonHost {
     }
 
     fn on_agent_event(&self, agent: &str, conversation_id: u64, event: &AgentEvent) {
-        let (kind, content) = match event {
+        /// Kind-specific payload built per match arm. `kind` is required —
+        /// no `Default` impl, so the compiler forces every arm to set it.
+        /// The other fields default to empty via struct update syntax.
+        struct Payload {
+            kind: AgentEventKind,
+            content: String,
+            tool_calls: Vec<ToolCallInfo>,
+            tool_output: String,
+        }
+
+        impl Payload {
+            fn of(kind: AgentEventKind) -> Self {
+                Self {
+                    kind,
+                    content: String::new(),
+                    tool_calls: Vec::new(),
+                    tool_output: String::new(),
+                }
+            }
+        }
+
+        let p = match event {
+            AgentEvent::TextStart => Payload::of(AgentEventKind::TextStart),
             AgentEvent::TextDelta(text) => {
                 tracing::trace!(%agent, text_len = text.len(), "agent text delta");
-                (AgentEventKind::TextDelta, String::new())
+                Payload {
+                    content: text.clone(),
+                    ..Payload::of(AgentEventKind::TextDelta)
+                }
             }
+            AgentEvent::TextEnd => Payload::of(AgentEventKind::TextEnd),
+            AgentEvent::ThinkingStart => Payload::of(AgentEventKind::ThinkingStart),
             AgentEvent::ThinkingDelta(text) => {
                 tracing::trace!(%agent, text_len = text.len(), "agent thinking delta");
-                (AgentEventKind::ThinkingDelta, String::new())
+                Payload {
+                    content: text.clone(),
+                    ..Payload::of(AgentEventKind::ThinkingDelta)
+                }
             }
+            AgentEvent::ThinkingEnd => Payload::of(AgentEventKind::ThinkingEnd),
             AgentEvent::ToolCallsBegin(_) => return,
             AgentEvent::ToolCallsStart(calls) => {
                 tracing::debug!(%agent, count = calls.len(), "agent tool calls");
-                let labels: Vec<String> = calls
-                    .iter()
-                    .map(|c| {
-                        if c.function.name == "bash"
-                            && let Ok(v) =
-                                serde_json::from_str::<serde_json::Value>(&c.function.arguments)
-                            && let Some(cmd) = v.get("command").and_then(|c| c.as_str())
-                        {
-                            return format!("bash({})", cmd.lines().next().unwrap_or(""));
-                        }
-                        c.function.name.clone()
-                    })
-                    .collect();
-                (AgentEventKind::ToolStart, labels.join(", "))
+                // Single pass over `calls` builds both the human label and
+                // the structured copy.
+                let mut labels = Vec::with_capacity(calls.len());
+                let mut structured = Vec::with_capacity(calls.len());
+                for c in calls {
+                    labels.push(tool_call_label(c));
+                    structured.push(ToolCallInfo {
+                        name: c.function.name.to_string(),
+                        arguments: c.function.arguments.clone(),
+                    });
+                }
+                Payload {
+                    content: labels.join(", "),
+                    tool_calls: structured,
+                    ..Payload::of(AgentEventKind::ToolStart)
+                }
             }
             AgentEvent::ToolResult {
                 call_id,
+                output,
                 duration_ms,
-                ..
             } => {
                 tracing::debug!(%agent, %call_id, %duration_ms, "agent tool result");
-                (AgentEventKind::ToolResult, format!("{duration_ms}ms"))
+                Payload {
+                    content: format!("{duration_ms}ms"),
+                    tool_output: truncate_for_broadcast(output, MAX_TOOL_OUTPUT_BROADCAST),
+                    ..Payload::of(AgentEventKind::ToolResult)
+                }
             }
             AgentEvent::ToolCallsComplete => {
                 tracing::debug!(%agent, "agent tool calls complete");
-                (AgentEventKind::ToolsComplete, String::new())
+                Payload::of(AgentEventKind::ToolsComplete)
             }
             AgentEvent::Compact { summary } => {
                 tracing::info!(%agent, summary_len = summary.len(), "context compacted");
@@ -216,8 +260,10 @@ impl Host for DaemonHost {
                     stop_reason = %response.stop_reason,
                     "agent run complete"
                 );
-                let content = format_usage(response);
-                (AgentEventKind::Done, content)
+                Payload {
+                    content: format_usage(response),
+                    ..Payload::of(AgentEventKind::Done)
+                }
             }
         };
         // The sender field is derived from the conversation's created_by.
@@ -227,9 +273,11 @@ impl Host for DaemonHost {
         let _ = self.events_tx.send(AgentEventMsg {
             agent: agent.to_string(),
             sender: conversation_id.to_string(),
-            kind: kind.into(),
-            content,
+            kind: p.kind.into(),
+            content: p.content,
             timestamp: chrono::Utc::now().to_rfc3339(),
+            tool_calls: p.tool_calls,
+            tool_output: p.tool_output,
         });
 
         // Publish agent completion to the event bus.
@@ -387,4 +435,41 @@ fn human_tokens(n: u32) -> String {
     } else {
         n.to_string()
     }
+}
+
+/// Build the human-readable label for a single tool call. Bash gets a
+/// special preview of its first line; everything else falls back to the
+/// function name. Used by the legacy `content` field for display-only
+/// consumers — rich UIs should read `tool_calls` directly.
+fn tool_call_label(c: &wcore::model::ToolCall) -> String {
+    if c.function.name == "bash"
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&c.function.arguments)
+        && let Some(cmd) = v.get("command").and_then(|c| c.as_str())
+    {
+        return format!("bash({})", cmd.lines().next().unwrap_or(""));
+    }
+    c.function.name.clone()
+}
+
+/// Truncate a tool output to at most `max` bytes for the event broadcast,
+/// snapping back to a UTF-8 char boundary and appending an elision marker
+/// if anything was dropped. Keeps the firehose lightweight.
+///
+/// If `max` is smaller than the marker itself, returns just the marker
+/// (which may exceed `max`). Caller is expected to size `max` generously
+/// — the helper exists to cap pathological multi-MB tool outputs, not
+/// to enforce a precise byte budget.
+fn truncate_for_broadcast(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_owned();
+    }
+    let marker = "…[truncated]";
+    if max <= marker.len() {
+        return marker.to_owned();
+    }
+    let mut end = max - marker.len();
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{marker}", &s[..end])
 }

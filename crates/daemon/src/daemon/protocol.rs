@@ -19,8 +19,9 @@ use wcore::protocol::{
         ProtoProviderKind, ProviderInfo, ProviderPresetInfo, PublishEventMsg, ResourceKind,
         SendMsg, SendResponse, SkillInfo, SourceKind, SteerSessionMsg, StreamChunk, StreamEnd,
         StreamEvent, StreamMsg, StreamStart, StreamThinking, SubscribeEventMsg, SubscriptionInfo,
-        SubscriptionList, TokenUsage, ToolCallInfo, ToolResultEvent, ToolStartEvent,
-        ToolsCompleteEvent, UpdateAgentMsg, UserSteeredEvent, plugin_event, stream_event,
+        SubscriptionList, TextEndEvent, TextStartEvent, ThinkingEndEvent, ThinkingStartEvent,
+        TokenUsage, ToolCallInfo, ToolResultEvent, ToolStartEvent, ToolsCompleteEvent,
+        UpdateAgentMsg, UserSteeredEvent, plugin_event, stream_event,
     },
 };
 use wcore::{AgentEvent, AgentStep};
@@ -91,11 +92,23 @@ impl<H: Host + 'static> Server for Daemon<H> {
             pin_mut!(stream);
             while let Some(event) = stream.next().await {
                 match event {
+                    AgentEvent::TextStart => {
+                        yield StreamEvent { event: Some(stream_event::Event::TextStart(TextStartEvent { agent: responding_agent.clone() })) };
+                    }
                     AgentEvent::TextDelta(text) => {
                         yield StreamEvent { event: Some(stream_event::Event::Chunk(StreamChunk { content: text })) };
                     }
+                    AgentEvent::TextEnd => {
+                        yield StreamEvent { event: Some(stream_event::Event::TextEnd(TextEndEvent { agent: responding_agent.clone() })) };
+                    }
+                    AgentEvent::ThinkingStart => {
+                        yield StreamEvent { event: Some(stream_event::Event::ThinkingStart(ThinkingStartEvent { agent: responding_agent.clone() })) };
+                    }
                     AgentEvent::ThinkingDelta(text) => {
                         yield StreamEvent { event: Some(stream_event::Event::Thinking(StreamThinking { content: text })) };
+                    }
+                    AgentEvent::ThinkingEnd => {
+                        yield StreamEvent { event: Some(stream_event::Event::ThinkingEnd(ThinkingEndEvent { agent: responding_agent.clone() })) };
                     }
                     AgentEvent::ToolCallsBegin(calls) => {
                         yield StreamEvent { event: Some(stream_event::Event::ToolStart(ToolStartEvent {
@@ -421,6 +434,13 @@ impl<H: Host + 'static> Server for Daemon<H> {
         if removed {
             std::fs::write(&manifest_path, doc.to_string())
                 .context("failed to write local manifest")?;
+            let prompt_file = self
+                .config_dir
+                .join(wcore::paths::AGENTS_DIR)
+                .join(format!("{name}.md"));
+            if prompt_file.exists() {
+                std::fs::remove_file(&prompt_file).context("failed to remove agent prompt file")?;
+            }
             self.reload().await?;
         }
         Ok(removed)
@@ -909,13 +929,7 @@ impl<H: Host + 'static> Server for Daemon<H> {
             } else if let Some(pkg_id) = dir_to_pkg.get(dir) {
                 (pkg_id.clone(), SourceKind::Plugin)
             } else {
-                let name = dir
-                    .components()
-                    .rev()
-                    .nth(1)
-                    .and_then(|c| c.as_os_str().to_str())
-                    .and_then(|s| s.strip_prefix('.'))
-                    .unwrap_or("external");
+                let name = wcore::external_source_name(dir).unwrap_or("external");
                 (name.to_string(), SourceKind::External)
             };
 
@@ -923,12 +937,14 @@ impl<H: Host + 'static> Server for Daemon<H> {
                 if !seen.insert(name.clone()) {
                     continue;
                 }
-                let enabled = !manifest.disabled.skills.contains(&name);
+                let enabled = !manifest.disabled.skills.contains(&name)
+                    && (source_kind != SourceKind::External
+                        || !manifest.disabled.external.contains(&source));
                 skills.push(SkillInfo {
                     name,
                     enabled,
                     source: source.clone(),
-                    source_kind: source_kind.into(),
+                    source_kind: source_kind as i32,
                 });
             }
         }
@@ -993,6 +1009,7 @@ impl<H: Host + 'static> Server for Daemon<H> {
             ResourceKind::Provider => "providers",
             ResourceKind::Mcp => "mcps",
             ResourceKind::Skill => "skills",
+            ResourceKind::ExternalSource => "external",
             ResourceKind::Unknown => anyhow::bail!("unknown resource kind"),
         };
         if disabled.get(key).is_none() {
@@ -1174,6 +1191,7 @@ impl<H: Host + 'static> Daemon<H> {
         let config = self.load_config()?;
         let (mut manifest, warnings) = wcore::resolve_manifests(&self.config_dir);
         manifest.disabled = config.disabled;
+        wcore::filter_disabled_external(&mut manifest.skill_dirs, &manifest.disabled.external);
         Ok((manifest, warnings))
     }
 

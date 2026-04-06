@@ -22,10 +22,18 @@ use wcore::protocol::{
 
 /// A typed chunk from the streaming response.
 pub enum OutputChunk {
-    /// Regular text content.
+    /// A text segment is starting.
+    TextStart,
+    /// Regular text content delta.
     Text(String),
-    /// Thinking/reasoning content (displayed dimmed).
+    /// The current text segment has ended.
+    TextEnd,
+    /// A thinking segment is starting.
+    ThinkingStart,
+    /// Thinking/reasoning content delta (displayed dimmed).
     Thinking(String),
+    /// The current thinking segment has ended.
+    ThinkingEnd,
     /// Tool execution started with these tool calls (name, arguments JSON).
     ToolStart(Vec<(String, String)>),
     /// Tool result returned (tool name, result content).
@@ -218,6 +226,16 @@ impl Runner {
                             Some(Err(anyhow::anyhow!("{}", end.error)))
                         }
                         Some(stream_event::Event::End(_)) => None,
+                        Some(stream_event::Event::TextStart(_)) => {
+                            Some(Ok(OutputChunk::TextStart))
+                        }
+                        Some(stream_event::Event::TextEnd(_)) => Some(Ok(OutputChunk::TextEnd)),
+                        Some(stream_event::Event::ThinkingStart(_)) => {
+                            Some(Ok(OutputChunk::ThinkingStart))
+                        }
+                        Some(stream_event::Event::ThinkingEnd(_)) => {
+                            Some(Ok(OutputChunk::ThinkingEnd))
+                        }
                         None => None,
                     },
                     Ok(ServerMessage {
