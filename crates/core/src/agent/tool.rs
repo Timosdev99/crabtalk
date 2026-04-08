@@ -1,10 +1,11 @@
 //! Tool registry (schema store), ToolRequest, and ToolSender.
 //!
-//! [`ToolRegistry`] stores tool schemas by name — no handlers, no closures.
-//! [`ToolRequest`] and [`ToolSender`] are the agent-side dispatch primitives:
-//! the agent sends a `ToolRequest` per tool call and awaits a `String` reply.
+//! [`ToolRegistry`] stores `crabllm_core::Tool` schemas by name — no
+//! handlers, no closures. [`ToolRequest`] and [`ToolSender`] are the
+//! agent-side dispatch primitives: the agent sends a `ToolRequest` per tool
+//! call and awaits a `String` reply.
 
-use crate::model::Tool;
+use crabllm_core::{FunctionDef, Tool, ToolType};
 use heck::ToSnakeCase;
 use schemars::JsonSchema;
 use std::collections::BTreeMap;
@@ -40,9 +41,9 @@ pub struct ToolRequest {
 
 /// Schema-only registry of named tools.
 ///
-/// Stores `Tool` definitions (name, description, JSON schema) keyed by name.
-/// Used by `Runtime` to filter tool schemas per agent at `add_agent` time.
-/// No handlers or closures are stored here.
+/// Stores `crabllm_core::Tool` definitions keyed by function name. Used by
+/// `Runtime` to filter tool schemas per agent at `add_agent` time. No
+/// handlers or closures are stored here.
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Tool>,
@@ -54,9 +55,9 @@ impl ToolRegistry {
         Self::default()
     }
 
-    /// Insert a tool schema.
+    /// Insert a tool schema, keyed by its function name.
     pub fn insert(&mut self, tool: Tool) {
-        self.tools.insert(tool.name.clone(), tool);
+        self.tools.insert(tool.function.name.clone(), tool);
     }
 
     /// Insert multiple tool schemas.
@@ -113,9 +114,10 @@ pub trait ToolDescription {
     const DESCRIPTION: &'static str;
 }
 
-/// Trait to convert a type into a tool.
+/// Trait to convert a type into a `crabllm_core::Tool`.
 pub trait AsTool: ToolDescription {
-    /// Convert the type into a tool.
+    /// Convert the type into a `crabllm_core::Tool` (the enveloped
+    /// `{kind, function}` wire shape).
     fn as_tool() -> Tool;
 }
 
@@ -124,11 +126,23 @@ where
     T: JsonSchema + ToolDescription,
 {
     fn as_tool() -> Tool {
+        // `strict: None` matches the prior wire behavior: the wcore
+        // `Tool.strict: bool` field was set to `true` by every `AsTool` impl
+        // but silently dropped by the converter (old convert::to_ct_tool
+        // hard-coded `strict: None`). Turning on strict-mode validation
+        // here would be a behavior change masquerading as a refactor —
+        // leave any opt-in to a separate commit that validates every tool
+        // schema.
         Tool {
-            name: T::schema_name().to_snake_case(),
-            description: Self::DESCRIPTION.into(),
-            parameters: schemars::schema_for!(T),
-            strict: true,
+            kind: ToolType::Function,
+            function: FunctionDef {
+                name: T::schema_name().to_snake_case(),
+                description: Some(Self::DESCRIPTION.into()),
+                parameters: Some(
+                    serde_json::to_value(schemars::schema_for!(T)).unwrap_or_default(),
+                ),
+            },
+            strict: None,
         }
     }
 }

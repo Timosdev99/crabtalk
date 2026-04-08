@@ -1,28 +1,24 @@
 //! Unified LLM interface types and the `Model<P>` wrapper.
 //!
-//! Provides the wcore-typed types used by `Agent` and `Runtime`:
-//! `Message`, `Request`, `Response`, `StreamChunk`, `Tool`, plus the
-//! `Model<P>` newtype that wraps any `crabllm_core::Provider` and exposes
-//! `send`/`stream` over wcore types.
+//! Thin re-export layer over `crabllm_core` for the core wire types
+//! (`Message`, `Tool`, `ToolCall`, `Usage`, …) plus crabtalk's own
+//! `HistoryEntry` wrapper and streaming `MessageBuilder`. `Model<P>` is the
+//! single seam between crabtalk and any `crabllm_core::Provider`.
 
+pub use builder::MessageBuilder;
 pub use client::Model;
-pub use limits::default_context_limit;
-pub use message::{Message, MessageBuilder, Role, estimate_tokens};
-pub use request::Request;
-pub use response::{
-    Choice, CompletionMeta, CompletionTokensDetails, Delta, FinishReason, Response, Usage,
+pub use crabllm_core::{
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, CompletionTokensDetails,
+    FinishReason, FunctionCall, FunctionDef, Message, Role, Tool, ToolCall, ToolCallDelta,
+    ToolChoice, ToolType, Usage,
 };
-pub use stream::StreamChunk;
-pub use tool::{FunctionCall, Tool, ToolCall, ToolChoice};
+pub use history::{HistoryEntry, estimate_tokens as estimate_history_tokens};
+pub use limits::default_context_limit;
 
+pub mod builder;
 mod client;
-pub(crate) mod convert;
+mod history;
 mod limits;
-mod message;
-mod request;
-mod response;
-mod stream;
-mod tool;
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_provider;

@@ -1,18 +1,26 @@
 //! `Model<P>` — newtype wrapper around an `Arc<P>` provider.
 //!
-//! Exposes `send` / `stream` over wcore types, doing the
-//! `wcore::Request` ↔ `crabllm_core::ChatCompletionRequest` conversion at
-//! the call site. The wrapper is the only place wcore touches crabllm wire
-//! types — agents and runtime see only the wcore-typed surface.
+//! Exposes `send` / `stream` over `crabllm_core` wire types. The wrapper
+//! earns its keep with two things the raw `Provider` trait doesn't do:
+//!
+//! 1. **Sets `stream: Some(true)` on streaming requests.** Without this flag,
+//!    OpenAI-shaped endpoints return a single non-SSE JSON response, the SSE
+//!    parser in crabllm-provider sees no `data:` prefixes, the byte stream
+//!    completes with zero chunks, and the agent loop yields a Done event
+//!    with empty content — "send a message, no reply, no error".
+//! 2. **Formats provider errors** with `format_provider_error` so the
+//!    upstream failure reason surfaces in the anyhow Display chain instead
+//!    of being buried in the error source.
 //!
 //! Cloning is cheap: `Model<P>` is `Arc<P>` internally, so `clone()` is one
 //! refcount bump regardless of `P`. This lets `Runtime` hold a single Model
 //! and clone it into every Agent at build time without any `P: Clone` bound.
 
-use crate::model::{Request, Response, StreamChunk, convert};
 use anyhow::Result;
 use async_stream::try_stream;
-use crabllm_core::{ApiError, Provider};
+use crabllm_core::{
+    ApiError, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Provider,
+};
 use futures_core::Stream;
 use futures_util::StreamExt;
 use std::sync::Arc;
@@ -44,49 +52,42 @@ impl<P: Provider + 'static> Model<P> {
         Self { inner: provider }
     }
 
-    /// Send a chat completion request, converting between wcore and
-    /// crabllm-core types at the boundary.
-    pub async fn send(&self, request: &Request) -> Result<Response> {
-        let mut ct_req = convert::to_ct_request(request);
-        // Explicit non-streaming. Equivalent to leaving `stream` unset on the
-        // wire (serde skips `None`), but matches the streaming path's
-        // explicit-flag pattern below for symmetry and to make intent clear.
-        ct_req.stream = Some(false);
-        let ct_resp = self
-            .inner
-            .chat_completion(&ct_req)
+    /// Send a non-streaming chat completion request.
+    ///
+    /// Sets `stream: Some(false)` on the request and formats provider errors
+    /// through `format_provider_error` so the root cause surfaces in the
+    /// anyhow Display chain.
+    pub async fn send_ct(&self, request: ChatCompletionRequest) -> Result<ChatCompletionResponse> {
+        let mut req = request;
+        req.stream = Some(false);
+        let model_label = req.model.clone();
+        self.inner
+            .chat_completion(&req)
             .await
-            .map_err(|e| format_provider_error(&request.model, "send", e))?;
-        Ok(convert::from_ct_response(ct_resp))
+            .map_err(|e| format_provider_error(&model_label, "send", e))
     }
 
-    /// Stream a chat completion response. The returned stream owns its
-    /// converted request and a clone of the inner Arc, so it is `'static`
-    /// and can be spawned freely.
-    pub fn stream(
+    /// Stream a chat completion response.
+    ///
+    /// The returned stream owns a clone of the provided request and the
+    /// inner Arc, so it is `'static` and can be spawned freely. Sets
+    /// `stream: Some(true)` — see module docs for why this is load-bearing.
+    pub fn stream_ct(
         &self,
-        request: Request,
-    ) -> impl Stream<Item = Result<StreamChunk>> + Send + 'static {
+        request: ChatCompletionRequest,
+    ) -> impl Stream<Item = Result<ChatCompletionChunk>> + Send + 'static {
         let inner = Arc::clone(&self.inner);
-        let mut ct_req = convert::to_ct_request(&request);
-        // Required: without `stream: true` in the request body, OpenAI-shaped
-        // endpoints return a single non-SSE JSON response, the SSE parser in
-        // crabllm-provider sees no `data:` prefixes, the byte stream completes
-        // with zero chunks, and the agent loop yields a Done event with empty
-        // content. Symptom is "send a message, no reply, no error" — silently
-        // dropped responses. The deleted crates/model wrapper set this flag
-        // explicitly; this is the same lift.
-        ct_req.stream = Some(true);
-        let model_label = request.model.clone();
+        let mut req = request;
+        req.stream = Some(true);
+        let model_label = req.model.clone();
         try_stream! {
             let mut stream = inner
-                .chat_completion_stream(&ct_req)
+                .chat_completion_stream(&req)
                 .await
                 .map_err(|e| format_provider_error(&model_label, "stream open", e))?;
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk
+                yield chunk
                     .map_err(|e| format_provider_error(&model_label, "stream chunk", e))?;
-                yield convert::from_ct_chunk(chunk);
             }
         }
     }
