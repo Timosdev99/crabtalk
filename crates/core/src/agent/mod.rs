@@ -15,7 +15,7 @@ pub use config::AgentConfig;
 use crabllm_core::{ChatCompletionRequest, Provider, Role, Tool, ToolCall, ToolChoice, Usage};
 use event::{AgentEvent, AgentResponse, AgentStep, AgentStopReason};
 use futures_core::Stream;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, future::join_all, stream::FuturesUnordered};
 use tokio::sync::{mpsc, oneshot, watch};
 pub use tool::{AsTool, ToolDescription, ToolRequest, ToolSender};
 
@@ -48,6 +48,17 @@ fn last_sender(history: &[HistoryEntry]) -> String {
         .find(|e| *e.role() == Role::User)
         .map(|e| e.sender.clone())
         .unwrap_or_default()
+}
+
+/// Borrow the inner string from a tool-dispatch result regardless of
+/// success/error. The LLM wire format (crabllm-core `Message`) has no
+/// `is_error` flag, so the agent collapses both arms to a plain string
+/// when appending to history. UI clients still get the distinction via
+/// `AgentEvent::ToolResult.output`.
+fn tool_output_text(result: &Result<String, String>) -> &str {
+    match result {
+        Ok(s) | Err(s) => s,
+    }
 }
 
 /// An immutable agent definition.
@@ -174,16 +185,18 @@ impl<P: Provider + 'static> Agent<P> {
         let mut tool_results = Vec::new();
         if !tool_calls.is_empty() {
             let sender = last_sender(history);
-            for tc in &tool_calls {
-                let result = self
-                    .dispatch_tool(
-                        &tc.function.name,
-                        &tc.function.arguments,
-                        &sender,
-                        conversation_id,
-                    )
-                    .await;
-                let entry = HistoryEntry::tool(&result, tc.id.clone(), &tc.function.name);
+            let outputs = join_all(tool_calls.iter().map(|tc| {
+                self.dispatch_tool(
+                    &tc.function.name,
+                    &tc.function.arguments,
+                    &sender,
+                    conversation_id,
+                )
+            }))
+            .await;
+            for (tc, result) in tool_calls.iter().zip(outputs) {
+                let entry =
+                    HistoryEntry::tool(tool_output_text(&result), tc.id.clone(), &tc.function.name);
                 history.push(entry.clone());
                 tool_results.push(entry);
             }
@@ -200,17 +213,21 @@ impl<P: Provider + 'static> Agent<P> {
 
     /// Dispatch a single tool call via the tool sender channel.
     ///
-    /// Returns the result string. If no sender is configured, returns an error
-    /// message without panicking.
+    /// Returns `Ok(output)` for normal tool output or `Err(message)` for a
+    /// failure. Dispatch-level problems (no sender, channel closed, reply
+    /// dropped) map to `Err`; the handler's own `Ok`/`Err` verdict is
+    /// forwarded unchanged.
     async fn dispatch_tool(
         &self,
         name: &str,
         args: &str,
         sender: &str,
         conversation_id: Option<u64>,
-    ) -> String {
+    ) -> Result<String, String> {
         let Some(tx) = &self.tool_tx else {
-            return format!("tool '{name}' called but no tool sender configured");
+            return Err(format!(
+                "tool '{name}' called but no tool sender configured"
+            ));
         };
         let (reply_tx, reply_rx) = oneshot::channel();
         let req = ToolRequest {
@@ -223,11 +240,11 @@ impl<P: Provider + 'static> Agent<P> {
             conversation_id,
         };
         if tx.send(req).is_err() {
-            return format!("tool channel closed while calling '{name}'");
+            return Err(format!("tool channel closed while calling '{name}'"));
         }
         reply_rx
             .await
-            .unwrap_or_else(|_| format!("tool '{name}' dropped reply"))
+            .unwrap_or_else(|_| Err(format!("tool '{name}' dropped reply")))
     }
 
     /// Determine the stop reason for a step with no tool calls.
@@ -428,28 +445,67 @@ impl<P: Provider + 'static> Agent<P> {
 
                 history.push(HistoryEntry::from_message(message.clone()));
 
-                // Dispatch tool calls if any.
+                // Dispatch tool calls concurrently.
                 //
-                // Batch the tool calls
+                // `FuturesUnordered` polls each dispatch future to completion
+                // independently so `ToolResult` events fire in completion
+                // order (fast tools don't wait on slow siblings in the UI).
+                // Outputs are buffered by the original call index so history
+                // entries append in call order — providers pair results to
+                // calls by position in some encodings, so this ordering is
+                // load-bearing.
                 let mut tool_results = Vec::new();
                 if has_tool_calls {
                     let sender = last_sender(history);
                     yield AgentEvent::ToolCallsStart(tool_calls.clone());
-                    for tc in &tool_calls {
-                        let tool_start = std::time::Instant::now();
-                        let result = self
-                            .dispatch_tool(&tc.function.name, &tc.function.arguments, &sender, conversation_id)
-                            .await;
-                        let duration_ms = tool_start.elapsed().as_millis() as u64;
-                        let entry = HistoryEntry::tool(&result, tc.id.clone(), &tc.function.name);
-                        history.push(entry.clone());
-                        tool_results.push(entry);
+
+                    let mut pending: FuturesUnordered<_> = tool_calls
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, tc)| {
+                            let fut = self.dispatch_tool(
+                                &tc.function.name,
+                                &tc.function.arguments,
+                                &sender,
+                                conversation_id,
+                            );
+                            // `start` is captured inside the async block so
+                            // it measures actual polled runtime, not the time
+                            // since `FuturesUnordered` was built.
+                            async move {
+                                let start = std::time::Instant::now();
+                                let out = fut.await;
+                                (idx, out, start.elapsed().as_millis() as u64)
+                            }
+                        })
+                        .collect();
+
+                    let mut buffered: Vec<Option<Result<String, String>>> =
+                        vec![None; tool_calls.len()];
+                    while let Some((idx, output, duration_ms)) = pending.next().await {
+                        let call_id = tool_calls[idx].id.clone();
+                        // Clone into the event; the owned Result lands in
+                        // `buffered[idx]` so the drain-loop tail can append
+                        // history entries in original call order.
                         yield AgentEvent::ToolResult {
-                            call_id: tc.id.clone(),
-                            output: result,
+                            call_id,
+                            output: output.clone(),
                             duration_ms,
                         };
+                        buffered[idx] = Some(output);
                     }
+
+                    for (tc, out) in tool_calls.iter().zip(buffered.into_iter()) {
+                        let out = out.expect("FuturesUnordered drained every slot");
+                        let entry = HistoryEntry::tool(
+                            tool_output_text(&out),
+                            tc.id.clone(),
+                            &tc.function.name,
+                        );
+                        history.push(entry.clone());
+                        tool_results.push(entry);
+                    }
+
                     yield AgentEvent::ToolCallsComplete;
                 }
 
