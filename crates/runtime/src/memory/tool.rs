@@ -5,6 +5,7 @@ use serde::Deserialize;
 use wcore::{
     agent::{AsTool, ToolDescription},
     model::Tool,
+    repos::Repos,
 };
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -63,7 +64,7 @@ pub fn tools() -> Vec<Tool> {
     ]
 }
 
-impl<H: Host> Env<H> {
+impl<H: Host, R: Repos> Env<H, R> {
     pub async fn dispatch_recall(&self, args: &str) -> Result<String, String> {
         let input: Recall =
             serde_json::from_str(args).map_err(|e| format!("invalid arguments: {e}"))?;

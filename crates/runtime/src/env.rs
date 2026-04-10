@@ -1,16 +1,17 @@
 //! Env — the embeddable engine environment.
 //!
 //! [`Env`] composes skill, MCP, OS, and memory sub-hooks. It implements
-//! `wcore::Hook` and provides the central `dispatch_tool` entry point. Server-
-//! specific tools (`ask_user`, `delegate`) are routed through the
+//! `wcore::Hook` and provides the central `dispatch_tool` entry point.
+//! Server-specific tools (`ask_user`, `delegate`) are routed through the
 //! [`Host`](crate::host::Host).
 
-use crate::{host::Host, mcp::McpHandler, memory::Memory, os, skill, skill::SkillHandler};
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
+use crate::{host::Host, memory::Memory, os, skill};
+use std::{collections::BTreeMap, path::PathBuf, sync::RwLock};
+use wcore::{
+    AgentConfig, AgentEvent, Hook,
+    model::HistoryEntry,
+    repos::{Repos, SkillRepo},
 };
-use wcore::{AgentConfig, AgentEvent, Hook, ToolRegistry, model::HistoryEntry};
 
 /// Per-agent scope for dispatch enforcement. Empty vecs = unrestricted.
 #[derive(Default)]
@@ -36,54 +37,48 @@ const MEMORY_TOOLS: &[&str] = &["recall", "remember", "memory", "forget"];
 /// Task delegation tools.
 const TASK_TOOLS: &[&str] = &["delegate"];
 
-pub struct Env<H: Host = crate::NoHost> {
-    pub(crate) skills: SkillHandler,
-    pub(crate) mcp: McpHandler,
+pub struct Env<H: Host, R: Repos> {
+    pub(crate) repos: R,
+    pub(crate) memory: Option<Memory<R::Memory>>,
     pub(crate) cwd: PathBuf,
-    pub(crate) memory: Option<Memory>,
-    pub(crate) scopes: BTreeMap<String, AgentScope>,
-    pub(crate) agent_descriptions: BTreeMap<String, String>,
+    pub(crate) scopes: RwLock<BTreeMap<String, AgentScope>>,
+    pub(crate) agent_descriptions: RwLock<BTreeMap<String, String>>,
     /// Host providing server-specific functionality.
     pub host: H,
 }
 
-impl<H: Host> Env<H> {
+impl<H: Host, R: Repos> Env<H, R> {
     /// Create a new Env with the given backends.
-    pub fn new(
-        skills: SkillHandler,
-        mcp: McpHandler,
-        cwd: PathBuf,
-        memory: Option<Memory>,
-        host: H,
-    ) -> Self {
+    pub fn new(repos: R, cwd: PathBuf, memory: Option<Memory<R::Memory>>, host: H) -> Self {
         Self {
-            skills,
-            mcp,
-            cwd,
+            repos,
             memory,
-            scopes: BTreeMap::new(),
-            agent_descriptions: BTreeMap::new(),
+            cwd,
+            scopes: RwLock::new(BTreeMap::new()),
+            agent_descriptions: RwLock::new(BTreeMap::new()),
             host,
         }
     }
 
     /// Access memory.
-    pub fn memory(&self) -> Option<&Memory> {
+    pub fn memory(&self) -> Option<&Memory<R::Memory>> {
         self.memory.as_ref()
     }
 
     /// List connected MCP servers with their tool names.
     pub fn mcp_servers(&self) -> Vec<(String, Vec<String>)> {
-        self.mcp.cached_list()
+        self.host.mcp_servers()
     }
 
     /// Register an agent's scope for dispatch enforcement.
-    pub fn register_scope(&mut self, name: String, config: &AgentConfig) {
+    pub fn register_scope(&self, name: String, config: &AgentConfig) {
         if name != wcore::paths::DEFAULT_AGENT && !config.description.is_empty() {
             self.agent_descriptions
+                .write()
+                .expect("agent_descriptions lock poisoned")
                 .insert(name.clone(), config.description.clone());
         }
-        self.scopes.insert(
+        self.scopes.write().expect("scopes lock poisoned").insert(
             name,
             AgentScope {
                 tools: config.tools.clone(),
@@ -92,6 +87,18 @@ impl<H: Host> Env<H> {
                 mcps: config.mcps.clone(),
             },
         );
+    }
+
+    /// Drop an agent's scope entry.
+    pub fn unregister_scope(&self, name: &str) {
+        self.scopes
+            .write()
+            .expect("scopes lock poisoned")
+            .remove(name);
+        self.agent_descriptions
+            .write()
+            .expect("agent_descriptions lock poisoned")
+            .remove(name);
     }
 
     /// Apply scoped tool whitelist and scope prompt for sub-agents.
@@ -158,32 +165,29 @@ impl<H: Host> Env<H> {
         }
 
         // Enforce skill scope.
-        if let Some(scope) = self.scopes.get(agent)
-            && !scope.skills.is_empty()
-            && !scope.skills.iter().any(|s| s == name)
         {
-            return content.to_owned();
+            let scopes = self.scopes.read().expect("scopes lock poisoned");
+            if let Some(scope) = scopes.get(agent)
+                && !scope.skills.is_empty()
+                && !scope.skills.iter().any(|s| s == name)
+            {
+                return content.to_owned();
+            }
         }
 
-        // Try to load the skill from disk.
-        for dir in &self.skills.skill_dirs {
-            let skill_file = dir.join(name).join("SKILL.md");
-            let Ok(file_content) = std::fs::read_to_string(&skill_file) else {
-                continue;
-            };
-            let Ok(skill) = skill::loader::parse_skill_md(&file_content) else {
-                continue;
-            };
-            let body = remainder.trim_start();
-            let block = format!("<skill name=\"{name}\">\n{}\n</skill>", skill.body);
-            return if body.is_empty() {
-                block
-            } else {
-                format!("{body}\n\n{block}")
-            };
+        // Load via SkillRepo.
+        match self.repos.skills().load(name) {
+            Ok(Some(skill)) => {
+                let body = remainder.trim_start();
+                let block = format!("<skill name=\"{name}\">\n{}\n</skill>", skill.body);
+                if body.is_empty() {
+                    block
+                } else {
+                    format!("{body}\n\n{block}")
+                }
+            }
+            _ => content.to_owned(),
         }
-
-        content.to_owned()
     }
 
     /// Validate member scope and delegate to the bridge.
@@ -193,20 +197,35 @@ impl<H: Host> Env<H> {
         if input.tasks.is_empty() {
             return Err("no tasks provided".to_owned());
         }
-        // Enforce members scope for all target agents.
-        if let Some(scope) = self.scopes.get(agent)
-            && !scope.members.is_empty()
         {
-            for task in &input.tasks {
-                if !scope.members.iter().any(|m| m == &task.agent) {
-                    return Err(format!(
-                        "agent '{}' is not in your members list",
-                        task.agent
-                    ));
+            let scopes = self.scopes.read().expect("scopes lock poisoned");
+            if let Some(scope) = scopes.get(agent)
+                && !scope.members.is_empty()
+            {
+                for task in &input.tasks {
+                    if !scope.members.iter().any(|m| m == &task.agent) {
+                        return Err(format!(
+                            "agent '{}' is not in your members list",
+                            task.agent
+                        ));
+                    }
                 }
             }
         }
         self.host.dispatch_delegate(args, agent).await
+    }
+
+    /// Dispatch the `mcp` tool — extract scope, delegate to Host.
+    async fn dispatch_mcp(&self, args: &str, agent: &str) -> Result<String, String> {
+        let allowed_mcps: Vec<String> = self
+            .scopes
+            .read()
+            .expect("scopes lock poisoned")
+            .get(agent)
+            .filter(|s| !s.mcps.is_empty())
+            .map(|s| s.mcps.clone())
+            .unwrap_or_default();
+        self.host.dispatch_mcp(args, &allowed_mcps).await
     }
 
     /// Route a tool call by name to the appropriate handler.
@@ -219,11 +238,14 @@ impl<H: Host> Env<H> {
         conversation_id: Option<u64>,
     ) -> Result<String, String> {
         // Dispatch enforcement: reject tools not in the agent's whitelist.
-        if let Some(scope) = self.scopes.get(agent)
-            && !scope.tools.is_empty()
-            && !scope.tools.iter().any(|t| t.as_str() == name)
         {
-            return Err(format!("tool not available: {name}"));
+            let scopes = self.scopes.read().expect("scopes lock poisoned");
+            if let Some(scope) = scopes.get(agent)
+                && !scope.tools.is_empty()
+                && !scope.tools.iter().any(|t| t.as_str() == name)
+            {
+                return Err(format!("tool not available: {name}"));
+            }
         }
         match name {
             "mcp" => self.dispatch_mcp(args, agent).await,
@@ -249,7 +271,13 @@ impl<H: Host> Env<H> {
     }
 }
 
-impl<H: Host + 'static> Hook for Env<H> {
+impl<H: Host + 'static, R: Repos> Hook for Env<H, R> {
+    type Repos = R;
+
+    fn repos(&self) -> &R {
+        &self.repos
+    }
+
     fn on_build_agent(&self, mut config: AgentConfig) -> AgentConfig {
         config.system_prompt.push_str(&os::environment_block());
 
@@ -261,7 +289,7 @@ impl<H: Host + 'static> Hook for Env<H> {
         }
 
         let mut hints = Vec::new();
-        let mcp_servers = self.mcp.cached_list();
+        let mcp_servers = self.host.mcp_servers();
         if !mcp_servers.is_empty() {
             let names: Vec<&str> = mcp_servers.iter().map(|(n, _)| n.as_str()).collect();
             hints.push(format!(
@@ -269,11 +297,13 @@ impl<H: Host + 'static> Hook for Env<H> {
                 names.join(", ")
             ));
         }
-        if let Ok(reg) = self.skills.registry.try_lock() {
-            let visible: Vec<_> = if config.skills.is_empty() {
-                reg.skills.iter().collect()
+
+        // List visible skills from the repo.
+        if let Ok(all_skills) = self.repos.skills().list() {
+            let visible: Vec<&wcore::repos::Skill> = if config.skills.is_empty() {
+                all_skills.iter().collect()
             } else {
-                reg.skills
+                all_skills
                     .iter()
                     .filter(|s| config.skills.iter().any(|n| n == &s.name))
                     .collect()
@@ -298,6 +328,7 @@ impl<H: Host + 'static> Hook for Env<H> {
                 ));
             }
         }
+
         if !hints.is_empty() {
             config.system_prompt.push_str(&format!(
                 "\n\n<resources>\n{}\n</resources>",
@@ -322,15 +353,23 @@ impl<H: Host + 'static> Hook for Env<H> {
         let mut entries = Vec::new();
         let has_members = self
             .scopes
+            .read()
+            .expect("scopes lock poisoned")
             .get(agent)
             .is_some_and(|s| !s.members.is_empty());
-        if has_members && !self.agent_descriptions.is_empty() {
-            let mut block = String::from("<agents>\n");
-            for (name, desc) in &self.agent_descriptions {
-                block.push_str(&format!("- {name}: {desc}\n"));
+        if has_members {
+            let descriptions = self
+                .agent_descriptions
+                .read()
+                .expect("agent_descriptions lock poisoned");
+            if !descriptions.is_empty() {
+                let mut block = String::from("<agents>\n");
+                for (name, desc) in descriptions.iter() {
+                    block.push_str(&format!("- {name}: {desc}\n"));
+                }
+                block.push_str("</agents>");
+                entries.push(HistoryEntry::user(block).auto_injected());
             }
-            block.push_str("</agents>");
-            entries.push(HistoryEntry::user(block).auto_injected());
         }
         if let Some(ref mem) = self.memory {
             entries.extend(mem.before_run(history));
@@ -346,14 +385,12 @@ impl<H: Host + 'static> Hook for Env<H> {
             ))
             .auto_injected(),
         );
-        if let Some(instructions) = discover_instructions(&cwd) {
+        if let Some(instructions) = self.host.discover_instructions(&cwd) {
             entries.push(
                 HistoryEntry::user(format!("<instructions>\n{instructions}\n</instructions>"))
                     .auto_injected(),
             );
         }
-        // If guest agents have spoken in this conversation, inject framing
-        // so the primary agent doesn't drift toward the guests' personality.
         if history.iter().any(|e| !e.agent.is_empty()) {
             entries.push(
                 HistoryEntry::user(
@@ -367,8 +404,12 @@ impl<H: Host + 'static> Hook for Env<H> {
         entries
     }
 
-    async fn on_register_tools(&self, tools: &mut ToolRegistry) {
-        self.mcp.register_tools(tools);
+    async fn on_register_tools(&self, tools: &mut wcore::ToolRegistry) {
+        // MCP tool schemas from the host (daemon provides these).
+        let mcp_tools = self.host.mcp_tools();
+        if !mcp_tools.is_empty() {
+            tools.insert_all(mcp_tools);
+        }
         tools.insert_all(os::tool::tools());
         tools.insert_all(os::read::tools());
         tools.insert_all(os::edit::tools());
@@ -383,42 +424,4 @@ impl<H: Host + 'static> Hook for Env<H> {
     fn on_event(&self, agent: &str, conversation_id: u64, event: &AgentEvent) {
         self.host.on_agent_event(agent, conversation_id, event);
     }
-}
-
-/// Collect layered `Crab.md` instructions: global (`~/.crabtalk/Crab.md`)
-/// first, then any `Crab.md` files found walking up from `cwd` (root-first,
-/// project-last so project instructions take precedence).
-fn discover_instructions(cwd: &Path) -> Option<String> {
-    let config_dir = &*wcore::paths::CONFIG_DIR;
-    let mut layers = Vec::new();
-
-    // Global instructions from config dir.
-    let global = config_dir.join("Crab.md");
-    if let Ok(content) = std::fs::read_to_string(&global) {
-        layers.push(content);
-    }
-
-    // Walk up from CWD collecting project Crab.md files.
-    let mut found = Vec::new();
-    let mut dir = cwd;
-    loop {
-        let candidate = dir.join("Crab.md");
-        if candidate.is_file()
-            && !candidate.starts_with(config_dir)
-            && let Ok(content) = std::fs::read_to_string(&candidate)
-        {
-            found.push(content);
-        }
-        match dir.parent() {
-            Some(p) => dir = p,
-            None => break,
-        }
-    }
-    found.reverse();
-    layers.extend(found);
-
-    if layers.is_empty() {
-        return None;
-    }
-    Some(layers.join("\n\n"))
 }

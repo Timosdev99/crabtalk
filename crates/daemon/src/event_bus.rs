@@ -1,13 +1,11 @@
-//! Daemon-level event bus — subscription-based routing.
+//! Daemon event bus — subscription-based routing to agents.
 //!
-//! Subscriptions match on exact `source` strings and fire target agents
-//! with the event payload as message content. Memory is authoritative at
-//! runtime; disk (`events.toml`) is recovery for restarts.
+//! Subscriptions match on an exact `source` string. When a matching
+//! event is published, the bus invokes a user-supplied `fire` callback.
+//! Persistence is direct filesystem I/O to `events/subscriptions.toml`.
 
-use crate::daemon::event::{DaemonEvent, DaemonEventSender};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::PathBuf};
-use wcore::protocol::message::{ClientMessage, SendMsg};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 /// Persistent event subscription.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,41 +24,43 @@ struct EventFile {
     subscription: Vec<EventSubscription>,
 }
 
-/// In-memory event bus with subscription routing.
+/// Callback signature for firing a matched subscription.
+pub type FireCallback = Arc<dyn Fn(&EventSubscription, &str) + Send + Sync>;
+
+/// In-memory event bus with filesystem-backed recovery.
 pub struct EventBus {
     subscriptions: HashMap<u64, EventSubscription>,
     next_id: u64,
-    events_path: PathBuf,
-    event_tx: DaemonEventSender,
+    path: PathBuf,
+    fire: FireCallback,
 }
 
 impl EventBus {
-    /// Load subscriptions from disk. Missing file is not an error.
-    pub fn load(events_path: PathBuf, event_tx: DaemonEventSender) -> Self {
+    /// Load subscriptions from `events/subscriptions.toml` under `root`.
+    pub fn load(root: PathBuf, fire: FireCallback) -> Self {
+        let path = root.join("events").join("subscriptions.toml");
         let mut subscriptions = HashMap::new();
         let mut max_id = 0u64;
-        if let Ok(content) = std::fs::read_to_string(&events_path) {
-            if let Ok(file) = toml::from_str::<EventFile>(&content) {
-                for sub in file.subscription {
-                    max_id = max_id.max(sub.id);
-                    subscriptions.insert(sub.id, sub);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            match toml::from_str::<EventFile>(&content) {
+                Ok(file) => {
+                    for sub in file.subscription {
+                        max_id = max_id.max(sub.id);
+                        subscriptions.insert(sub.id, sub);
+                    }
                 }
-            } else {
-                tracing::warn!(
-                    "failed to parse {}, starting with empty subscriptions",
-                    events_path.display()
-                );
+                Err(e) => tracing::warn!("failed to parse {}: {e}", path.display()),
             }
         }
         Self {
             subscriptions,
             next_id: max_id + 1,
-            events_path,
-            event_tx,
+            path,
+            fire,
         }
     }
 
-    /// Create a new subscription. Assigns an ID and persists to disk.
+    /// Create a new subscription.
     pub fn subscribe(&mut self, mut sub: EventSubscription) -> EventSubscription {
         sub.id = self.next_id;
         self.next_id += 1;
@@ -69,7 +69,7 @@ impl EventBus {
         sub
     }
 
-    /// Remove a subscription. Returns whether it existed.
+    /// Remove a subscription.
     pub fn unsubscribe(&mut self, id: u64) -> bool {
         if self.subscriptions.remove(&id).is_none() {
             return false;
@@ -83,13 +83,12 @@ impl EventBus {
         self.subscriptions.values().cloned().collect()
     }
 
-    /// Publish an event. Fires all subscriptions matching `source` (exact match),
-    /// removes `once` subscriptions after firing.
+    /// Publish an event. Fires every matching subscription.
     pub fn publish(&mut self, source: &str, payload: &str) {
         let mut to_remove = Vec::new();
         for (id, sub) in &self.subscriptions {
             if sub.source == source {
-                self.fire_agent(sub, payload);
+                (self.fire)(sub, payload);
                 if sub.once {
                     to_remove.push(*id);
                 }
@@ -103,29 +102,6 @@ impl EventBus {
         }
     }
 
-    /// Fire a target agent with the event payload. Fire-and-forget.
-    fn fire_agent(&self, sub: &EventSubscription, payload: &str) {
-        tracing::info!(
-            "event bus: firing agent='{}' for source='{}'",
-            sub.target_agent,
-            sub.source,
-        );
-        let (reply_tx, _) = tokio::sync::mpsc::channel(1);
-        let msg = ClientMessage::from(SendMsg {
-            agent: sub.target_agent.clone(),
-            content: payload.to_owned(),
-            sender: Some(format!("event:{}", sub.source)),
-            cwd: None,
-            guest: None,
-            tool_choice: None,
-        });
-        let _ = self.event_tx.send(DaemonEvent::Message {
-            msg,
-            reply: reply_tx,
-        });
-    }
-
-    /// Write-through to `events.toml`. Uses atomic write (tmp + rename).
     fn save(&self) {
         let file = EventFile {
             subscription: self.subscriptions.values().cloned().collect(),
@@ -137,17 +113,11 @@ impl EventBus {
                 return;
             }
         };
-        let tmp = self.events_path.with_extension("toml.tmp");
-        if let Err(e) = std::fs::write(&tmp, &content) {
-            tracing::error!("failed to write {}: {e}", tmp.display());
-            return;
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
         }
-        if let Err(e) = std::fs::rename(&tmp, &self.events_path) {
-            tracing::error!(
-                "failed to rename {} -> {}: {e}",
-                tmp.display(),
-                self.events_path.display()
-            );
+        if let Err(e) = std::fs::write(&self.path, &content) {
+            tracing::error!("failed to write {}: {e}", self.path.display());
         }
     }
 }

@@ -1,85 +1,62 @@
-//! Built-in memory — file-per-entry storage at `{config_dir}/memory/`.
+//! Built-in memory — cached access to a [`MemoryRepo`] backend.
+//!
+//! `Memory` wraps a `MemoryRepo` with an in-process entry cache (for
+//! BM25 recall scoring) and the MEMORY.md index. The repo owns the
+//! physical layout; Memory owns search and prompt generation.
 
 use crate::config::MemoryConfig;
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
-    sync::RwLock,
+    sync::{Arc, RwLock},
 };
-use wcore::model::{HistoryEntry, Role};
+use wcore::{
+    model::{HistoryEntry, Role},
+    repos::{MemoryEntry, MemoryRepo},
+};
 
 pub mod bm25;
 pub mod entry;
-pub mod storage;
 pub mod tool;
-
-use entry::MemoryEntry;
-use storage::Storage;
 
 const MEMORY_PROMPT: &str = include_str!("../../prompts/memory.md");
 
 pub const DEFAULT_SOUL: &str = include_str!("../../prompts/crab.md");
 
-pub struct Memory {
-    storage: Box<dyn Storage>,
+pub struct Memory<M: MemoryRepo> {
+    repo: Arc<M>,
     entries: RwLock<HashMap<String, MemoryEntry>>,
     index: RwLock<String>,
-    index_path: PathBuf,
-    entries_dir: PathBuf,
     config: MemoryConfig,
 }
 
-impl Memory {
-    /// Open (or create) memory storage at the given directory.
-    pub fn open(dir: PathBuf, config: MemoryConfig, storage: Box<dyn Storage>) -> Self {
-        let entries_dir = dir.join("entries");
-        let index_path = dir.join("MEMORY.md");
-
-        storage.create_dir_all(&entries_dir).ok();
-
+impl<M: MemoryRepo> Memory<M> {
+    /// Open memory storage against the given repo backend.
+    pub fn open(config: MemoryConfig, repo: Arc<M>) -> Self {
         let mem = Self {
-            storage,
+            repo,
             entries: RwLock::new(HashMap::new()),
             index: RwLock::new(String::new()),
-            index_path,
-            entries_dir,
             config,
         };
 
-        mem.migrate_legacy(&dir);
         mem.load_entries();
         mem.load_index();
         mem
     }
 
     fn load_entries(&self) {
-        let paths = match self.storage.list(&self.entries_dir) {
-            Ok(p) => p,
+        let loaded = match self.repo.list() {
+            Ok(entries) => entries,
             Err(_) => return,
         };
-
-        let mut entries = self.entries.write().unwrap();
-        for path in paths {
-            if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                continue;
-            }
-            let raw = match self.storage.read(&path) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            match MemoryEntry::parse(path, &raw) {
-                Ok(entry) => {
-                    entries.insert(entry.name.clone(), entry);
-                }
-                Err(e) => {
-                    tracing::warn!("failed to parse memory entry: {e}");
-                }
-            }
+        let mut cache = self.entries.write().unwrap();
+        for entry in loaded {
+            cache.insert(entry.name.clone(), entry);
         }
     }
 
     fn load_index(&self) {
-        if let Ok(content) = self.storage.read(&self.index_path) {
+        if let Ok(Some(content)) = self.repo.load_index() {
             *self.index.write().unwrap() = content;
         }
     }
@@ -116,8 +93,12 @@ impl Memory {
 
     /// Create or update a memory entry.
     pub fn remember(&self, name: String, description: String, content: String) -> String {
-        let entry = MemoryEntry::new(name.clone(), description, content, &self.entries_dir);
-        if let Err(e) = entry.save(self.storage.as_ref()) {
+        let entry = MemoryEntry {
+            name: name.clone(),
+            description,
+            content,
+        };
+        if let Err(e) = self.repo.save(&entry) {
             return format!("failed to save entry: {e}");
         }
         self.entries.write().unwrap().insert(name.clone(), entry);
@@ -128,9 +109,9 @@ impl Memory {
     pub fn forget(&self, name: &str) -> String {
         let mut entries = self.entries.write().unwrap();
         match entries.remove(name) {
-            Some(entry) => {
-                if let Err(e) = entry.delete(self.storage.as_ref()) {
-                    tracing::warn!("failed to delete entry file: {e}");
+            Some(_) => {
+                if let Err(e) = self.repo.delete(name) {
+                    tracing::warn!("failed to delete memory entry '{name}': {e}");
                 }
                 format!("forgot: {name}")
             }
@@ -140,7 +121,7 @@ impl Memory {
 
     /// Overwrite MEMORY.md (the curated overview).
     pub fn write_index(&self, content: &str) -> String {
-        if let Err(e) = self.storage.write(&self.index_path, content) {
+        if let Err(e) = self.repo.save_index(content) {
             return format!("failed to write MEMORY.md: {e}");
         }
         *self.index.write().unwrap() = content.to_owned();
@@ -185,78 +166,5 @@ impl Memory {
         }
 
         vec![HistoryEntry::user(format!("<recall>\n{result}\n</recall>")).auto_injected()]
-    }
-
-    fn migrate_legacy(&self, dir: &Path) {
-        let existing = self.storage.list(&self.entries_dir).unwrap_or_default();
-        if !existing.is_empty() {
-            return;
-        }
-
-        let memory_path = dir.join("memory.md");
-        let user_path = dir.join("user.md");
-        let facts_path = dir.join("facts.toml");
-
-        let has_legacy = self.storage.exists(&memory_path)
-            || self.storage.exists(&user_path)
-            || self.storage.exists(&facts_path);
-
-        if !has_legacy {
-            return;
-        }
-
-        if let Ok(content) = self.storage.read(&memory_path)
-            && !content.trim().is_empty()
-        {
-            self.storage.write(&self.index_path, &content).ok();
-
-            for (i, chunk) in content.split("\n\n").enumerate() {
-                let chunk = chunk.trim();
-                if chunk.is_empty() {
-                    continue;
-                }
-                let name = format!("migrated-memory-{}", i + 1);
-                let entry = MemoryEntry::new(
-                    name,
-                    "Migrated from memory.md".to_owned(),
-                    chunk.to_owned(),
-                    &self.entries_dir,
-                );
-                entry.save(self.storage.as_ref()).ok();
-            }
-            self.storage
-                .rename(&memory_path, &dir.join("memory.md.bak"))
-                .ok();
-        }
-
-        if let Ok(content) = self.storage.read(&user_path)
-            && !content.trim().is_empty()
-        {
-            let entry = MemoryEntry::new(
-                "user-profile".to_owned(),
-                "User profile migrated from user.md".to_owned(),
-                content,
-                &self.entries_dir,
-            );
-            entry.save(self.storage.as_ref()).ok();
-            self.storage
-                .rename(&user_path, &dir.join("user.md.bak"))
-                .ok();
-        }
-
-        if let Ok(content) = self.storage.read(&facts_path)
-            && !content.trim().is_empty()
-        {
-            let entry = MemoryEntry::new(
-                "known-facts".to_owned(),
-                "Known facts migrated from facts.toml".to_owned(),
-                content,
-                &self.entries_dir,
-            );
-            entry.save(self.storage.as_ref()).ok();
-            self.storage
-                .rename(&facts_path, &dir.join("facts.toml.bak"))
-                .ok();
-        }
     }
 }

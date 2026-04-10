@@ -1,6 +1,7 @@
 //! Server trait implementation for the Daemon.
 
-use crate::{cron::CronEntry, daemon::Daemon, event_bus::EventSubscription};
+use crate::event_bus::EventSubscription;
+use crate::{cron::CronEntry, daemon::Daemon};
 use anyhow::{Context, Result};
 use crabllm_core::Provider;
 use futures_util::{StreamExt, pin_mut};
@@ -25,7 +26,10 @@ use wcore::protocol::{
         UpdateAgentMsg, UserSteeredEvent, plugin_event, stream_event,
     },
 };
-use wcore::{AgentEvent, AgentStep};
+use wcore::{
+    AgentEvent, AgentStep,
+    repos::{AgentRepo, Repos, SessionRepo},
+};
 
 impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
     async fn send(&self, req: SendMsg) -> Result<SendResponse> {
@@ -393,23 +397,54 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
 
     async fn create_agent(&self, req: CreateAgentMsg) -> Result<AgentInfo> {
         validate_agent_name(&req.name)?;
-        self.write_agent_to_manifest(&req.name, &req.config, true)?;
-        self.write_agent_prompt(&req.name, &req.prompt)?;
-        self.reload().await?;
+        // Normalize identity: mint a fresh ULID if the client didn't
+        // already supply one. Stored in the manifest so subsequent
+        // loads see the same id.
+        let mut config: wcore::AgentConfig =
+            serde_json::from_str(&req.config).context("invalid AgentConfig JSON")?;
+        if config.id.is_nil() {
+            config.id = wcore::AgentId::new();
+        }
+        let id = config.id;
+        let normalized = serde_json::to_string(&config)
+            .context("failed to re-serialize normalized agent config")?;
+        self.write_agent_to_manifest(&req.name, &normalized, true)?;
+        // Prompt lands at the ULID-keyed Storage path.
+        self.write_agent_prompt_to_storage(&id, &req.prompt).await?;
+        self.register_agent_from_disk(&req.name).await?;
         self.get_agent(req.name).await
     }
 
     async fn update_agent(&self, req: UpdateAgentMsg) -> Result<AgentInfo> {
         validate_agent_name(&req.name)?;
         if req.name == wcore::paths::DEFAULT_AGENT {
+            // System crab keeps its baked-in prompt — req.prompt is
+            // ignored on this path, matching the fact that load_agents
+            // always overrides crab.system_prompt with SYSTEM_AGENT.
             self.write_system_crab_config(&req.config)?;
         } else {
-            self.write_agent_to_manifest(&req.name, &req.config, false)?;
+            // Preserve the existing ULID across updates so session
+            // and cron references stay stable. Mint one only if the
+            // manifest has no record of this agent yet.
+            let mut config: wcore::AgentConfig =
+                serde_json::from_str(&req.config).context("invalid AgentConfig JSON")?;
+            let existing = self.existing_agent_id(&req.name)?;
+            config.id = existing.unwrap_or_else(|| {
+                if config.id.is_nil() {
+                    wcore::AgentId::new()
+                } else {
+                    config.id
+                }
+            });
+            let id = config.id;
+            let normalized = serde_json::to_string(&config)
+                .context("failed to re-serialize normalized agent config")?;
+            self.write_agent_to_manifest(&req.name, &normalized, false)?;
+            if !req.prompt.is_empty() {
+                self.write_agent_prompt_to_storage(&id, &req.prompt).await?;
+            }
         }
-        if !req.prompt.is_empty() {
-            self.write_agent_prompt(&req.name, &req.prompt)?;
-        }
-        self.reload().await?;
+        self.register_agent_from_disk(&req.name).await?;
         self.get_agent(req.name).await
     }
 
@@ -423,6 +458,11 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
         if !manifest_path.exists() {
             return Ok(false);
         }
+
+        // Capture the ULID before we mutate the manifest so we can
+        // delete the matching Storage-keyed prompt afterwards.
+        let existing_id = self.existing_agent_id(&name)?;
+
         let content =
             std::fs::read_to_string(&manifest_path).context("failed to read local manifest")?;
         let mut doc: DocumentMut = content.parse().context("failed to parse local manifest")?;
@@ -435,14 +475,26 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
         if removed {
             std::fs::write(&manifest_path, doc.to_string())
                 .context("failed to write local manifest")?;
-            let prompt_file = self
+
+            // Remove the repo-keyed prompt and legacy fs prompt.
+            let rt = self.runtime.read().await.clone();
+            if let Some(id) = existing_id
+                && let Err(e) = rt.repos().agents().delete(&id)
+            {
+                tracing::warn!("failed to delete agent prompt for {id}: {e}");
+            }
+            let legacy = self
                 .config_dir
                 .join(wcore::paths::AGENTS_DIR)
                 .join(format!("{name}.md"));
-            if prompt_file.exists() {
-                std::fs::remove_file(&prompt_file).context("failed to remove agent prompt file")?;
+            if legacy.exists() {
+                let _ = std::fs::remove_file(&legacy);
             }
-            self.reload().await?;
+
+            // Targeted in-memory removal — keeps ephemeral agents and
+            // in-flight conversations alive, unlike a full reload().
+            rt.remove_agent(&name);
+            rt.hook.unregister_scope(&name);
         }
         Ok(removed)
     }
@@ -611,19 +663,28 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
         agent: String,
         sender: String,
     ) -> Result<Vec<ConversationInfo>> {
-        let sessions_dir = self.config_dir.join("sessions");
-        tokio::task::spawn_blocking(move || scan_conversations_all(&sessions_dir, &agent, &sender))
-            .await
-            .context("conversation scan task panicked")
+        let rt = self.runtime.read().await.clone();
+        Ok(scan_sessions(
+            rt.repos().sessions().as_ref(),
+            &agent,
+            &sender,
+        ))
     }
 
     async fn get_conversation_history(&self, file_path: String) -> Result<ConversationHistory> {
-        let path = std::path::PathBuf::from(&file_path);
-        anyhow::ensure!(path.exists(), "conversation file not found: {file_path}");
-        let (meta, messages) =
-            tokio::task::spawn_blocking(move || wcore::Conversation::load_context(&path))
-                .await
-                .context("load_context task panicked")??;
+        // The protocol still calls this `file_path`, but post-Phase-7
+        // it carries a session slug (e.g. `crab_user_3`). Look it up
+        // through the runtime Storage.
+        let slug = file_path;
+        let rt = self.runtime.read().await.clone();
+        let handle = wcore::repos::SessionHandle::new(&slug);
+        let snapshot = rt
+            .repos()
+            .sessions()
+            .load(&handle)?
+            .ok_or_else(|| anyhow::anyhow!("conversation not found: {slug}"))?;
+        let meta = snapshot.meta;
+        let messages = snapshot.history;
         Ok(ConversationHistory {
             title: meta.title,
             agent: meta.agent,
@@ -644,9 +705,13 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
     }
 
     async fn delete_conversation(&self, file_path: String) -> Result<()> {
-        let path = std::path::Path::new(&file_path);
-        anyhow::ensure!(path.exists(), "conversation file not found: {file_path}");
-        std::fs::remove_file(path).with_context(|| format!("failed to delete {file_path}"))?;
+        let slug = file_path;
+        let rt = self.runtime.read().await.clone();
+        let handle = wcore::repos::SessionHandle::new(&slug);
+        let deleted = rt.repos().sessions().delete(&handle)?;
+        if !deleted {
+            anyhow::bail!("conversation not found: {slug}");
+        }
         Ok(())
     }
 
@@ -1207,6 +1272,40 @@ impl<P: Provider + 'static, H: Host + 'static> Daemon<P, H> {
         Ok((manifest, warnings))
     }
 
+    /// Load a single agent's config from disk and upsert it into the live
+    /// runtime. Used by `create_agent` and `update_agent` after they've
+    /// written manifest/prompt files. Avoids a full `reload()` — the
+    /// runtime's other state (provider, skills, MCP, memory, ephemeral
+    /// agents, in-flight conversations) is preserved.
+    async fn register_agent_from_disk(&self, name: &str) -> Result<()> {
+        let config = self.load_config()?;
+        let (manifest, _warnings) = self.resolve_manifests()?;
+        let rt = self.runtime.read().await.clone();
+        let agent_config = crate::daemon::builder::build_single_agent_config(
+            name,
+            &config,
+            &manifest,
+            rt.repos().agents().as_ref(),
+        )?;
+        // `upsert_agent` returns the post-`on_build_agent` config so the
+        // dispatch scope matches the form actually stored in the registry.
+        let registered = rt.upsert_agent(agent_config);
+        rt.hook.register_scope(name.to_owned(), &registered);
+        Ok(())
+    }
+
+    /// Look up the stable `AgentId` already recorded for `name` in the
+    /// local manifest, if any. Used by update/delete to preserve
+    /// identity across edits.
+    fn existing_agent_id(&self, name: &str) -> Result<Option<wcore::AgentId>> {
+        let (manifest, _) = self.resolve_manifests()?;
+        Ok(manifest
+            .agents
+            .get(name)
+            .filter(|cfg| !cfg.id.is_nil())
+            .map(|cfg| cfg.id))
+    }
+
     /// Look up a command service by name from installed plugin manifests.
     fn find_command_service(
         &self,
@@ -1277,13 +1376,19 @@ impl<P: Provider + 'static, H: Host + 'static> Daemon<P, H> {
         Ok(())
     }
 
-    /// Write an agent's system prompt to `local/agents/{name}.md`.
-    fn write_agent_prompt(&self, name: &str, prompt: &str) -> Result<()> {
-        let agents_dir = self.config_dir.join(wcore::paths::AGENTS_DIR);
-        std::fs::create_dir_all(&agents_dir).context("failed to create agents directory")?;
-        std::fs::write(agents_dir.join(format!("{name}.md")), prompt)
-            .context("failed to write agent prompt file")?;
-        Ok(())
+    /// Write an agent's system prompt to the runtime Storage at
+    /// Write an agent's prompt via the agent repo.
+    async fn write_agent_prompt_to_storage(&self, id: &wcore::AgentId, prompt: &str) -> Result<()> {
+        let rt = self.runtime.read().await.clone();
+        // Build a minimal config to upsert via the repo.
+        let config = wcore::AgentConfig {
+            id: *id,
+            ..Default::default()
+        };
+        rt.repos()
+            .agents()
+            .upsert(&config, prompt)
+            .with_context(|| format!("failed to write agent prompt for {id}"))
     }
 
     /// Write config into `[system.crab]` in `config.toml`.
@@ -1367,136 +1472,88 @@ fn plugin_output(content: &str) -> PluginEvent {
     }
 }
 
-/// Scan session files and return conversation info.
+/// Scan sessions out of the runtime Storage and return conversation info.
 ///
-/// If `agent` and `sender` are both empty, returns all conversations.
-/// Otherwise, filters to the given identity.
-fn scan_conversations_all(
-    sessions_dir: &std::path::Path,
-    agent: &str,
-    sender: &str,
-) -> Vec<ConversationInfo> {
-    let Ok(entries) = std::fs::read_dir(sessions_dir) else {
+/// List conversations via the session repo.
+fn scan_sessions(repo: &impl SessionRepo, agent: &str, sender: &str) -> Vec<ConversationInfo> {
+    let Ok(summaries) = repo.list_sessions() else {
         return Vec::new();
     };
 
-    let filter_prefix = if !agent.is_empty() && !sender.is_empty() {
-        Some(format!("{}_{}_", agent, wcore::sender_slug(sender)))
-    } else {
+    let agent_filter = if agent.is_empty() {
         None
+    } else {
+        Some(wcore::sender_slug(agent))
+    };
+    let sender_filter = if sender.is_empty() {
+        None
+    } else {
+        Some(wcore::sender_slug(sender))
     };
 
-    let today = chrono::Local::now().date_naive();
     let mut results = Vec::new();
-
-    for file in entries.flatten() {
-        let path = file.path();
-        if path.is_dir() {
+    for summary in summaries {
+        let slug = summary.handle.as_str().to_owned();
+        let meta = &summary.meta;
+        let Some((slug_agent, slug_sender, seq)) = parse_session_slug(&slug) else {
             continue;
-        }
-        let name = file.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.ends_with(".jsonl") {
-            continue;
-        }
-
-        if let Some(ref prefix) = filter_prefix
-            && !name.starts_with(prefix)
+        };
+        if let Some(ref want) = agent_filter
+            && &slug_agent != want
         {
             continue;
         }
-
-        let Some((file_agent, file_sender, seq, title)) = parse_session_filename(name) else {
-            continue;
-        };
-
-        if filter_prefix.is_none() && !agent.is_empty() && file_agent != agent {
+        if let Some(ref want) = sender_filter
+            && &slug_sender != want
+        {
             continue;
         }
-
-        let mtime = file
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        let (alive_secs, message_count) = read_session_file_stats(&path);
-        let date = mtime_to_label(mtime, today);
-
-        results.push((
-            mtime,
-            ConversationInfo {
-                agent: file_agent,
-                sender: file_sender,
-                seq,
-                title,
-                file_path: path.to_string_lossy().into_owned(),
-                message_count,
-                alive_secs,
-                date,
-            },
-        ));
+        results.push(ConversationInfo {
+            agent: meta.agent.clone(),
+            sender: meta.created_by.clone(),
+            seq,
+            title: meta.title.clone(),
+            file_path: slug,
+            message_count: 0, // not available from summary
+            alive_secs: meta.uptime_secs,
+            date: created_date_label(&meta.created_at),
+        });
     }
 
-    // Sort by mtime descending (most recently active first).
-    results.sort_by(|a, b| b.0.cmp(&a.0));
-    results.into_iter().map(|(_, info)| info).collect()
+    results.sort_by(|a, b| b.seq.cmp(&a.seq).then_with(|| a.agent.cmp(&b.agent)));
+    results
 }
 
-/// Parse a session filename into (agent, sender, seq, title).
-///
-/// Format: `{agent}_{sender}_{seq}[_{title}].jsonl`
-fn parse_session_filename(name: &str) -> Option<(String, String, u32, String)> {
-    let stem = name.strip_suffix(".jsonl")?;
-    let parts: Vec<&str> = stem.split('_').collect();
+/// Parse a session slug `{agent}_{sender}_{seq}` back into components.
+/// Post-Phase-7 slugs no longer carry a title suffix; any trailing
+/// segments after the numeric seq are treated as sender continuation
+/// before the seq (title lived in a filename before and now lives in
+/// the meta blob).
+fn parse_session_slug(slug: &str) -> Option<(String, String, u32)> {
+    let parts: Vec<&str> = slug.split('_').collect();
     if parts.len() < 3 {
         return None;
     }
-    // Find the first numeric part after position 1 (that's the seq).
-    for i in 2..parts.len() {
-        if !parts[i].is_empty() && parts[i].chars().all(|c| c.is_ascii_digit()) {
-            let agent = parts[0].to_string();
-            let sender = parts[1..i].join("_");
-            let seq: u32 = parts[i].parse().ok()?;
-            let title = if i + 1 < parts.len() {
-                parts[i + 1..].join("_")
-            } else {
-                String::new()
-            };
-            return Some((agent, sender, seq, title));
-        }
+    // Seq is the last numeric segment; everything before part 0 is the
+    // agent, the middle is the sender.
+    let last = parts.len() - 1;
+    if !parts[last].chars().all(|c| c.is_ascii_digit()) || parts[last].is_empty() {
+        return None;
     }
-    None
+    let seq: u32 = parts[last].parse().ok()?;
+    let agent = parts[0].to_string();
+    let sender = parts[1..last].join("_");
+    Some((agent, sender, seq))
 }
 
-/// Read uptime_secs from meta line and count message lines.
-fn read_session_file_stats(path: &std::path::Path) -> (u64, u64) {
-    use std::io::{BufRead, BufReader};
-
-    let Ok(file) = std::fs::File::open(path) else {
-        return (0, 0);
+/// Convert a RFC3339 meta `created_at` string into a human-readable
+/// label (Today / Yesterday / YYYY-MM-DD). Empty on parse failure.
+fn created_date_label(created_at: &str) -> String {
+    let Ok(ts) = chrono::DateTime::parse_from_rfc3339(created_at) else {
+        return String::new();
     };
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
-
-    let uptime = lines
-        .next()
-        .and_then(|l| l.ok())
-        .and_then(|l| {
-            let v: serde_json::Value = serde_json::from_str(&l).ok()?;
-            v.get("uptime_secs")?.as_u64()
-        })
-        .unwrap_or(0);
-
-    let msg_count = lines
-        .map_while(|l| l.ok())
-        .filter(|l| !l.trim().is_empty() && !l.contains("\"compact\""))
-        .count() as u64;
-
-    (uptime, msg_count)
-}
-
-/// Convert a file mtime to a human-readable date label.
-fn mtime_to_label(mtime: std::time::SystemTime, today: chrono::NaiveDate) -> String {
-    let date = chrono::DateTime::<chrono::Local>::from(mtime).date_naive();
+    let today = chrono::Local::now().date_naive();
+    let date = ts.with_timezone(&chrono::Local).date_naive();
     if date == today {
         "Today".to_string()
     } else if date == today - chrono::Duration::days(1) {

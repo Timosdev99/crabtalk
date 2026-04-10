@@ -6,7 +6,9 @@ pub mod cron;
 pub mod daemon;
 pub mod event_bus;
 pub mod hook;
+pub mod mcp;
 pub mod provider;
+pub mod repos;
 
 pub use config::DaemonConfig;
 #[cfg(unix)]

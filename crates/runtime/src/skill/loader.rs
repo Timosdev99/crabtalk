@@ -1,9 +1,12 @@
-//! Skill markdown loading.
+//! Skill markdown parsing.
+//!
+//! [`parse_skill_md`] parses a SKILL.md file (YAML frontmatter +
+//! Markdown body) into a [`Skill`]. Used by daemon's `FsSkillRepo`
+//! when loading skills from disk.
 
-use crate::skill::{Skill, SkillRegistry};
 use serde::{Deserialize, Deserializer};
-use std::{collections::BTreeMap, path::Path};
-use wcore::utils::split_yaml_frontmatter;
+use std::collections::BTreeMap;
+use wcore::{repos::Skill, utils::split_yaml_frontmatter};
 
 /// Accept both `"a, b, c"` (string) and `["a", "b", "c"]` (sequence) for tool lists.
 fn string_or_vec<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
@@ -44,62 +47,13 @@ pub fn parse_skill_md(content: &str) -> anyhow::Result<Skill> {
     let (frontmatter, body) = split_yaml_frontmatter(content)?;
     let fm: SkillFrontmatter = serde_yml::from_str(frontmatter)?;
 
-    let metadata = fm.metadata;
-
     Ok(Skill {
         name: fm.name,
         description: fm.description,
         license: fm.license,
         compatibility: fm.compatibility,
-        metadata,
+        metadata: fm.metadata,
         allowed_tools: fm.allowed_tools,
         body: body.to_owned(),
     })
-}
-
-/// Load skills by searching for `SKILL.md` files in subdirectories.
-pub fn load_skills_dir(path: impl AsRef<Path>) -> anyhow::Result<SkillRegistry> {
-    let path = path.as_ref();
-    let mut registry = SkillRegistry::new();
-    scan_skills(path, &mut registry)?;
-    Ok(registry)
-}
-
-fn scan_skills(dir: &Path, registry: &mut SkillRegistry) -> anyhow::Result<()> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(()),
-    };
-
-    for entry in entries {
-        let entry = entry?;
-        let entry_path = entry.path();
-        if !entry_path.is_dir() {
-            continue;
-        }
-
-        if entry
-            .file_name()
-            .to_str()
-            .is_some_and(|n| n.starts_with('.'))
-        {
-            continue;
-        }
-
-        let skill_file = entry_path.join("SKILL.md");
-        if skill_file.exists() {
-            let content = std::fs::read_to_string(&skill_file)
-                .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", skill_file.display()))?;
-            match parse_skill_md(&content) {
-                Ok(skill) => registry.add(skill),
-                Err(e) => {
-                    tracing::warn!("failed to parse {}: {e}", skill_file.display());
-                }
-            }
-        } else {
-            scan_skills(&entry_path, registry)?;
-        }
-    }
-
-    Ok(())
 }

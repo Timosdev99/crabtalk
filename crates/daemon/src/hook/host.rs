@@ -7,7 +7,7 @@ use crate::daemon::event::{DaemonEvent, DaemonEventSender};
 use runtime::host::Host;
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -17,6 +17,7 @@ use std::{
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use wcore::{
     AgentEvent,
+    agent::AsTool,
     protocol::message::{
         AgentEventKind, AgentEventMsg, ClientMessage, SendMsg, ToolCallInfo, server_message,
     },
@@ -30,7 +31,8 @@ const MAX_TOOL_OUTPUT_BROADCAST: usize = 2048;
 /// Timeout for waiting on user reply (5 minutes).
 const ASK_USER_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Server-specific host for the daemon. Owns event channels and session state.
+/// Server-specific host for the daemon. Owns event channels, session state,
+/// and the MCP bridge (subprocess/HTTP connections to MCP tool servers).
 #[derive(Clone)]
 pub struct DaemonHost {
     /// Event channel for task delegation.
@@ -41,6 +43,9 @@ pub struct DaemonHost {
     pub(crate) conversation_cwds: Arc<Mutex<HashMap<u64, PathBuf>>>,
     /// Broadcast channel for agent events (console subscription).
     pub(crate) events_tx: broadcast::Sender<AgentEventMsg>,
+    /// MCP bridge — connects to MCP tool servers. Daemon-owned because
+    /// MCP involves spawning child processes and opening HTTP connections.
+    pub(crate) mcp: Arc<crate::mcp::McpHandler>,
 }
 
 impl Host for DaemonHost {
@@ -324,6 +329,67 @@ impl Host for DaemonHost {
     fn subscribe_events(&self) -> Option<broadcast::Receiver<AgentEventMsg>> {
         Some(self.events_tx.subscribe())
     }
+
+    fn discover_instructions(&self, cwd: &Path) -> Option<String> {
+        discover_instructions(cwd)
+    }
+
+    async fn dispatch_mcp(&self, args: &str, allowed_mcps: &[String]) -> Result<String, String> {
+        crate::mcp::dispatch::dispatch_mcp(&self.mcp, args, allowed_mcps).await
+    }
+
+    fn mcp_servers(&self) -> Vec<(String, Vec<String>)> {
+        self.mcp.cached_list()
+    }
+
+    fn mcp_tools(&self) -> Vec<wcore::model::Tool> {
+        vec![runtime::mcp::tool::Mcp::as_tool()]
+    }
+
+    fn set_mcp(&mut self, handler: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        if let Ok(mcp) = handler.downcast::<crate::mcp::McpHandler>() {
+            self.mcp = mcp;
+        }
+    }
+}
+
+/// Collect layered `Crab.md` instructions: global
+/// (`~/.crabtalk/Crab.md`) first, then any `Crab.md` files found
+/// walking up from `cwd` (root-first, project-last so project
+/// instructions take precedence). Paths under the config dir are
+/// skipped on the walk so a user who runs crabtalk from
+/// `~/.crabtalk/` doesn't double-count the global file.
+fn discover_instructions(cwd: &Path) -> Option<String> {
+    let config_dir = &*wcore::paths::CONFIG_DIR;
+    let mut layers = Vec::new();
+
+    let global = config_dir.join("Crab.md");
+    if let Ok(content) = std::fs::read_to_string(&global) {
+        layers.push(content);
+    }
+
+    let mut found = Vec::new();
+    let mut dir = cwd;
+    loop {
+        let candidate = dir.join("Crab.md");
+        if candidate.is_file()
+            && !candidate.starts_with(config_dir)
+            && let Ok(content) = std::fs::read_to_string(&candidate)
+        {
+            found.push(content);
+        }
+        match dir.parent() {
+            Some(p) => dir = p,
+            None => break,
+        }
+    }
+    found.reverse();
+    layers.extend(found);
+
+    if layers.is_empty() {
+        return None;
+    }
+    Some(layers.join("\n\n"))
 }
 
 /// Generate a unique delegate sender identity.

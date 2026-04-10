@@ -1,8 +1,9 @@
 //! Daemon configuration loaded from TOML.
 
+pub use crate::mcp::{McpHandler, McpServerConfig};
 use anyhow::{Result, bail};
 pub use loader::{DEFAULT_CONFIG, scaffold_config_dir};
-pub use runtime::{McpHandler, SystemConfig, mcp::McpServerConfig};
+pub use runtime::SystemConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 #[cfg(unix)]
@@ -27,7 +28,10 @@ pub fn validate_providers(providers: &BTreeMap<String, ProviderDef>) -> Result<(
     Ok(())
 }
 
+mod backfill;
 mod loader;
+
+pub use backfill::{backfill_local_agent_ids, migrate_local_agent_prompts};
 
 /// Top-level daemon configuration (`config.toml`).
 ///

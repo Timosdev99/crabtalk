@@ -12,7 +12,7 @@
 //! - Agent event types: [`AgentEvent`], [`AgentStep`], [`AgentResponse`], [`AgentStopReason`].
 
 pub use agent::{
-    Agent, AgentBuilder, AgentConfig,
+    Agent, AgentBuilder, AgentConfig, AgentId,
     event::{AgentEvent, AgentResponse, AgentStep, AgentStopReason},
     tool::{ToolRegistry, ToolRequest, ToolSender},
 };
@@ -21,8 +21,11 @@ pub use config::{
     Setup, check_skill_conflicts, external_source_name, filter_disabled_external, load_agents_dir,
     load_agents_dirs, repo_slug, resolve_manifests, scan_skill_names,
 };
+#[cfg(feature = "test-utils")]
+pub use runtime::hook::TestHook;
 pub use runtime::{
-    Conversation, Runtime, conversation::find_latest_conversation, conversation::sender_slug,
+    Conversation, Runtime,
+    conversation::{ArchiveSegment, ConversationMeta, EventLine, sender_slug},
     hook::Hook,
 };
 
@@ -31,5 +34,6 @@ pub mod config;
 pub mod model;
 pub mod paths;
 pub mod protocol;
+pub mod repos;
 mod runtime;
 pub mod utils;

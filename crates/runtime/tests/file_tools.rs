@@ -1,11 +1,11 @@
 //! Tests for read and edit tools.
 
-use crabtalk_runtime::{Env, NoHost, SkillHandler, mcp::McpHandler};
+use crabtalk_runtime::{Env, NoHost};
+use wcore::repos::mem::InMemoryRepos;
 
-async fn test_env(cwd: std::path::PathBuf) -> Env<NoHost> {
-    let skills = SkillHandler::default();
-    let mcp = McpHandler::load(&[]).await;
-    Env::new(skills, mcp, cwd, None, NoHost)
+async fn test_env(cwd: std::path::PathBuf) -> Env<NoHost, InMemoryRepos> {
+    let repos = InMemoryRepos::new();
+    Env::new(repos, cwd, None, NoHost)
 }
 
 // --- read ---
@@ -194,7 +194,7 @@ async fn file_tools_no_sender_restriction() {
     let file = dir.path().join("gateway.txt");
     std::fs::write(&file, "test content\n").unwrap();
 
-    let mut hook = test_env(dir.path().to_path_buf()).await;
+    let hook = test_env(dir.path().to_path_buf()).await;
     let config = wcore::AgentConfig::new("agent");
     hook.register_scope("agent".to_owned(), &config);
 
