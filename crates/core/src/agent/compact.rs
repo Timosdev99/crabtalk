@@ -5,6 +5,21 @@ use crabllm_core::{ChatCompletionRequest, Message, Provider, Role};
 
 pub(crate) const COMPACT_PROMPT: &str = include_str!("../../prompts/compact.md");
 
+fn floor_char_boundary(s: &str, max_len: usize) -> usize {
+    if max_len >= s.len() {
+        return s.len();
+    }
+    if s.is_char_boundary(max_len) {
+        return max_len;
+    }
+
+    let mut idx = max_len;
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
 impl<P: Provider + 'static> super::Agent<P> {
     /// Summarize the conversation history using the LLM.
     ///
@@ -32,7 +47,7 @@ impl<P: Provider + 'static> super::Agent<P> {
                 && let Some(serde_json::Value::String(text)) = msg.content.as_mut()
                 && text.len() > max_len
             {
-                text.truncate(text.floor_char_boundary(max_len));
+                text.truncate(floor_char_boundary(text, max_len));
                 text.push_str("... [truncated]");
             }
             messages.push(msg);
